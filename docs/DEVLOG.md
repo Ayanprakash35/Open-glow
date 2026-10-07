@@ -219,13 +219,34 @@ Glow didn't change it, which ruled the app out.
 - Decided against drawing on the lock screen: macOS gives apps no public way to do it, and the
   project doesn't use private APIs. The glow pauses completely while the screen is locked.
 
-In progress the same day:
+Built the same day, each by a separate agent in its own copy of the project, then merged and wired
+together:
 
-- **Coding-session glow** — a sweep in Claude's colors when a Claude Code session starts, or
-  Codex's when a Codex session starts, detected from their processes.
-- **Welcome tour** — a window that walks through permissions, music apps, look and motion,
-  coding sessions and launch at login.
-- **Timers and Pomodoro** — a ring of light that recedes around the screen as time runs out, with
-  the countdown in the menu bar.
-- **Phase 6 polish** — lower CPU for rendering and analysis, pausing on screen lock, and recovery
-  from audio-device changes, players quitting and permissions being revoked.
+- **Coding-session glow.** Each Claude Code session is its own `claude` process (from the terminal
+  or the Claude app), and each Codex session a `codex` process, so Open Glow watches the process
+  list every 1.5 s — about 0.04 ms a look — and plays a sweep in the tool's colors when a new one
+  appears. Reading Claude Code's own entry point showed it also starts itself for jobs that aren't
+  sessions (a browser bridge, built-in MCP servers, background workers, pre-started spares); those
+  are filtered out so they don't trigger false sweeps.
+- **Welcome tour.** Six pages — welcome, Music Sync permission, album colors and which players to
+  follow, look and motion, coding sessions, and timers plus launch at login — with a small animated
+  display whose edges glow. Its music animation first thumped on every beat; it now swells and
+  glides like the real glow.
+- **Timers and Pomodoro.** Time is measured on a monotonic clock that keeps counting through sleep
+  (the uptime clock on this Mac had missed six days of sleep over eight days), so a timer left
+  running with the lid closed is right when it opens. The whole edge starts lit and recedes
+  clockwise from the top; the countdown replaces the menu-bar icon; each phase ends with three soft
+  pulses and a chime.
+- **Edge cases.** Lock screen, screen saver, fast user switching and sleep are tracked as separate
+  reasons to pause — every one of the 90 orderings of lock, display sleep and system sleep ends in
+  the right state. Capture recovers on its own after headphones or the output device change, a
+  stream that delivers unreadable audio is replaced, and a revoked permission shows the warning
+  instead of retrying forever.
+- **CPU.** The renderer now computes only cells the light can currently reach and hands frames to
+  Core Animation as IOSurfaces with no copy — 0.06 ms per frame, down from 0.15 ms, with frames
+  pixel-for-pixel within a few levels of before. The beat detector now runs whenever audio arrives
+  instead of on a 10.7 ms timer, uses a fast selection instead of sorting for its medians, and keeps
+  its threshold history sorted: about 4× less CPU and 2.6 wake-ups a second instead of 92, with
+  bit-identical beats.
+
+**First release, v0.1.0** — published on GitHub with a downloadable app.

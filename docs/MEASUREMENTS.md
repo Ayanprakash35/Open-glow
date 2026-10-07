@@ -62,6 +62,7 @@ release build unless noted:
 | First version, debug build | 10.3 ms |
 | Release build, floating-point pixel loop | 0.40 ms |
 | Release build, packed-integer pixel loop | 0.15 ms |
+| Release build, only reachable cells, IOSurface output (≈39,000 cells) | 0.06 ms |
 
 Frame pacing: 60 fps while music is playing, 30 fps for the idle flow, nothing at all while the
 glow holds still or is hidden.
@@ -76,7 +77,15 @@ Measured with `top` over several 2 s samples.
 | Idle flow, 30 fps | 5–6% | — |
 | Music Sync, 60 fps | 8–11% | 10–13% |
 
-These are the numbers going into the Phase 6 performance work; results will be added here.
+Phase 6 then cut both halves of the work:
+
+| Part | Before | After |
+|---|---|---|
+| Rendering one frame (release) | 0.15 ms | 0.06 ms |
+| Audio analysis, CPU per second of music (release, best of 21 runs) | 2,243 µs | 543 µs |
+| Analysis timer wake-ups per second while music plays | ≈ 92 | ≈ 2.6 |
+| Steady mode | — | 0% (nothing is drawn while the glow holds still) |
+| Coding-session check (every 1.5 s, ≈530 processes) | — | 0.03–0.04 ms |
 
 ## Album colors
 

@@ -29,15 +29,14 @@ It listens to your Mac's **audio output**, never the microphone.
 - **Music Sync** — beats become smooth swells that travel along the edges: the bigger the hit, the
   bigger the swell. Optional stereo mode lets each side follow its own channel.
 - **Flow** — with no music (or in Flow mode), the colors drift around the screen in soft blobs.
-- **Coding-session glow** *(in progress)* — optionally, a sweep of Claude's warm orange when a
-  Claude Code session starts, or Codex's colors when a Codex session starts.
-- **Timers and Pomodoro** *(in progress)* — a ring of light that recedes around the screen as time
-  runs out, with the countdown in the menu bar.
+- **Coding-session glow** — optionally, a sweep of Claude's warm orange when a Claude Code session
+  starts, or Codex's colors when a Codex session starts.
+- **Timers and Pomodoro** — the whole edge lights up and the light recedes around the screen as
+  time runs out, with the countdown in place of the menu-bar icon and soft pulses at the end.
 - **Your own colors** — a two-color gradient with a blend slider, or one of the presets.
 - **Opening sweep** — light rises from the bottom of the screen and meets at the top whenever Open
   Glow starts.
-- **Welcome tour** *(in progress)*, per-display toggles, launch at login, and every setting
-  applies live.
+- **Welcome tour**, per-display toggles, launch at login, and every setting applies live.
 - **Light on resources** — no dependencies, no private APIs; see [Performance](#performance).
 
 ## Screenshots
@@ -121,7 +120,8 @@ artist, album and title. Nothing else leaves your Mac.
 ## Using Open Glow
 
 Open Glow lives in the menu bar. **Click** the icon for settings; **right-click** (or
-Control-click) for quick options and Quit.
+Control-click) for quick options, timers and Quit. The welcome tour opens on first launch; reopen
+it from the right-click menu or the **?** in the settings popover.
 
 ### Animation
 
@@ -147,11 +147,21 @@ Control-click) for quick options and Quit.
 is a faint, wide bloom). Turn individual displays on or off, and choose whether the light curves
 around the notch.
 
-### Coding sessions *(in progress)*
+### Timers and Pomodoro
+
+Right-click the menu-bar icon › **Timer**: 5, 10, 15, 25 or 45 minutes, an hour, or a custom
+length — or **Start Pomodoro** (25-minute focus rounds with 5-minute breaks and a 15-minute break
+after every fourth round). While a timer runs, the whole edge starts lit and the light recedes
+clockwise from the top as time runs out; the countdown replaces the menu-bar icon; each phase
+ends with three soft pulses and a gentle chime. Pause, resume, skip a phase or cancel from the
+same menu. Time keeps counting while the Mac sleeps.
+
+### Coding sessions
 
 Tick **Glow when a coding session starts** and Open Glow plays a short sweep in Claude's colors
 when a Claude Code session starts, or Codex's colors for Codex — from the terminal or the Claude
-app. It notices sessions by watching for their processes; nothing is sent anywhere.
+app. It notices sessions by watching for their processes (a quick look at the process list every
+1.5 s, about 0.04 ms each time); nothing is sent anywhere.
 
 ## Troubleshooting
 
@@ -174,8 +184,9 @@ artwork. Black-and-white covers glow white on purpose.
 switches to when *some* app opens their microphone (check System Settings › Sound › Input).
 Open Glow never opens the microphone.
 
-**Nothing on the lock screen.** By design — macOS doesn't let apps draw there, and Open Glow
-pauses completely while the screen is locked.
+**Nothing on the lock screen.** By design — macOS gives apps no public way to draw there, and Open
+Glow pauses completely (rendering and audio capture) while the screen is locked, the screen saver
+runs, or another user is switched in. Timers keep counting.
 
 **Watching the logs.** In zsh, `log` is a built-in, so use the full path:
 
@@ -190,7 +201,10 @@ unit and a sensible range:
 
 | Constants | File | Controls |
 |---|---|---|
-| `GlowMotionConfig` | `GlowMotion.swift` | Flow speed, swell rise and fall, beat weight, opening sweep, accent sweep |
+| `GlowMotionConfig` | `GlowMotion.swift` | Flow speed, swell rise and fall, beat weight, opening sweep |
+| `GlowAccentConfig`, `TimerRingConfig` | `GlowAccent.swift`, `GlowTimerRing.swift` | Coding-session sweep; timer ring and finish pulses |
+| `PomodoroConfig` | `GlowTimer.swift` | Focus, break and long-break lengths |
+| `CodingSessionConfig` | `CodingSessionMonitor.swift` | How often sessions are looked for, and each tool's colors |
 | `EdgeLightConfig` | `EdgeLightRasterizer.swift` | Falloff shape, tail, resolution |
 | `EdgeGeometryConfig` | `EdgeGeometry.swift` | Corner roundness |
 | `GlowDefaults` | `GlowRenderer.swift` | Default brightness, thickness, softness |
@@ -212,8 +226,9 @@ unit and a sensible range:
   edges.
 - **Rendering** — `EdgeLightRasterizer` turns that state into four strip images (top, bottom,
   left, right) — light falling off smoothly from the edge — computed with integer math in the
-  display's own color space; `GlowView` shows them as Core Animation layer contents, scaled up
-  smoothly, in a click-through window above everything on each display.
+  display's own color space and handed to Core Animation as IOSurfaces (no per-frame copy);
+  `GlowView` shows them scaled up smoothly in a click-through window above everything on each
+  display. Nothing is drawn while the glow holds still or its window isn't visible.
 - **Colors** — `NowPlayingMonitor` follows Music and Spotify through their notifications and
   AppleScript; `ArtworkLookup` finds covers for streamed tracks; `ColorExtractor` picks two colors
   with k-means in CIELAB.
@@ -221,36 +236,54 @@ unit and a sensible range:
 ```
 Sources/OpenGlow/
   AppDelegate.swift             menu bar, popover, capture lifecycle
+  MusicSyncPlan.swift           what capture should do, as a pure decision
+  ScreenSessionMonitor.swift    lock, sleep, screen saver, fast user switching
+  CaptureRecovery.swift         retries and recovery after capture stops
   Settings.swift                every preference, persisted
   SettingsView.swift            the popover
+  Onboarding*.swift             the welcome tour
   DisplayManager.swift          one overlay window per display
   OverlayWindowController.swift the click-through overlay window
   GlowRenderer.swift            GlowView: layers and frame pacing
   GlowMotion.swift              what the light does from moment to moment
+  GlowAccent.swift              the coding-session sweep
+  GlowTimerRing.swift           the receding timer ring and finish pulses
   EdgeLightRasterizer.swift     state → pixels
   EdgeGeometry.swift            distance from the edge, position around the screen
   AudioEngine.swift             system-audio capture
   AudioRingBuffer.swift         capture → analysis hand-off
   BeatDetector.swift            FFT, beats, loudness
+  Median.swift                  fast medians for the onset thresholds
   ColorCoordinator.swift        which palette to show
   NowPlaying*.swift             Music and Spotify
   ArtworkLookup.swift           covers for streamed tracks
   ColorExtractor.swift          artwork → palette
   GlowPalette.swift             colors and presets
+  CodingSession*.swift          Claude Code and Codex sessions
+  ProcessTable.swift            reading the process list (libproc)
+  GlowTimer.swift               timer and Pomodoro model
+  TimerController.swift         the running timer
+  TimerMenu.swift               timer menu and menu-bar countdown
+  TimerPresenter.swift          timer → ring, pulses and countdown
   LaunchAtLogin.swift           SMAppService
 ```
 
 ## Performance
 
-Measured on a MacBook Air (M-series, 15-inch) with one display:
+Open Glow does almost nothing when there's nothing to show: no frames are drawn while the glow
+holds still (Steady mode) or is hidden, and analysis only runs while music plays. Measured on a
+15-inch MacBook Air:
 
-| State | Open Glow CPU | Extra WindowServer CPU |
-|---|---|---|
-| Idle flow (30 fps) | 5–6% | — |
-| Music Sync (60 fps) | 8–11% | 10–13% |
+| Work | Cost |
+|---|---|
+| Drawing one frame of the edge light (1710 × 1112 pt display) | 0.06 ms |
+| Analysing one second of music (FFT, beats, loudness) | ≈ 0.5 ms |
+| Checking for new coding sessions (every 1.5 s) | ≈ 0.04 ms |
+| Steady mode | 0% CPU |
 
-Phase 6 is bringing these down; see [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md) for how they're
-measured and the full history in [docs/DEVLOG.md](docs/DEVLOG.md).
+Frames run at 60 fps while music plays and 30 fps for the idle flow. The full numbers, and how
+they were measured, are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md); the story behind them is
+in [docs/DEVLOG.md](docs/DEVLOG.md).
 
 ## Contributing
 
