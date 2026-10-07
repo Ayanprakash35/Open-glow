@@ -101,7 +101,7 @@ struct SettingsView: View {
         case .captureUnreadable:
             attention(
                 title: "Music Sync can't read the captured audio",
-                detail: "macOS is delivering audio in a form Open Glow can't read, so the glow stays idle. Relaunching Open Glow starts a fresh capture.",
+                detail: "macOS is delivering audio in a form Open Glow can't read, so the glow stays idle. Open Glow keeps trying fresh captures; relaunching may also help.",
                 primary: ("Relaunch Open Glow", actions.relaunch),
                 isPermissionProblem: false
             )

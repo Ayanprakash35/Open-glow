@@ -25,6 +25,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var audioEngine: AudioEngine!
     private var beatDetector: BeatDetector!
     private var sessionMonitor: ScreenSessionMonitor!
+    private var codingSessionGlow: CodingSessionGlow!
+    private var timers: TimerPresenter!
+    /// Created the first time the tour opens and kept: its `finish` runs while its window closes.
+    private var onboarding: OnboardingWindowController?
+    private var onboardingRefreshTimer: Timer?
 
     private var isSyncingAudio = false
     private var loggedMissingPermission = false
@@ -49,6 +54,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         sessionMonitor = ScreenSessionMonitor()
         displayManager = DisplayManager()
         colorCoordinator = ColorCoordinator(settings: settings, displayManager: displayManager)
+        codingSessionGlow = CodingSessionGlow(displayManager: displayManager)
+        timers = TimerPresenter(displayManager: displayManager, statusItem: statusItem)
+        timers.onCountdownEnded = { [weak self] in self?.refreshStatus() }
 
         displayManager.applyBaseAppearanceToAll()
         displayManager.onDisplaysChanged = { [weak self] in self?.reconcileAudio() }
@@ -68,6 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         sessionMonitor.onChange = { [weak self] old, new in self?.sessionChanged(from: old, to: new) }
 
         settings.onChange = { [weak self] change in self?.settingsChanged(change) }
+        updateCodingSessionGlow()
 
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(accessibilityOptionsChanged),
@@ -81,6 +90,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(appDidResignActive), name: NSApplication.didResignActiveNotification, object: nil)
 
         reconcileAudio()
+
+        if !settings.hasCompletedOnboarding {
+            showOnboarding()
+        }
     }
 
     // MARK: - Status item and popover
@@ -105,7 +118,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             relaunch: { [weak self] in self?.relaunch() },
             setLaunchAtLogin: { [weak self] enabled in self?.setLaunchAtLogin(enabled) },
             openLoginItems: { LaunchAtLogin.openLoginItemsSettings() },
-            quit: { NSApp.terminate(nil) }
+            quit: { NSApp.terminate(nil) },
+            openTour: { [weak self] in self?.showOnboarding() }
         )
         let host = NSHostingController(rootView: SettingsView(settings: settings, status: statusModel, actions: actions))
         host.sizingOptions = .preferredContentSize
@@ -201,6 +215,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         menu.addItem(displaysMenuItem())
         menu.addItem(notchMenuItem())
 
+        menu.addItem(.separator())
+        menu.addItem(timers.menuItem())
+
         let attentionItems = attentionMenuItems()
         if !attentionItems.isEmpty {
             menu.addItem(.separator())
@@ -208,6 +225,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         menu.addItem(.separator())
+
+        let tourItem = NSMenuItem(title: "Welcome Tour…", action: #selector(openTour), keyEquivalent: "")
+        tourItem.target = self
+        menu.addItem(tourItem)
 
         let quitItem = NSMenuItem(title: "Quit Open Glow", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quitItem)
@@ -290,6 +311,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         settings.isEnabled.toggle()
     }
 
+    @objc private func openTour() {
+        showOnboarding()
+    }
+
     @objc private func openSettings() {
         togglePopover()
     }
@@ -322,6 +347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             displayManager.applyVisibility()
             colorCoordinator.update(animated: false)
             if settings.isEnabled { displayManager.playIntro() }
+            updateCodingSessionGlow()
             reconcileAudio()
         case .animationMode:
             retry.reset()
@@ -334,7 +360,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             displayManager.refreshNotchMode()
         case .players:
             colorCoordinator.update(animated: true)
-        case .codingSessionGlow, .onboarding:
+        case .codingSessionGlow:
+            updateCodingSessionGlow()
+        case .onboarding:
             break
         case .stereoMode, .shape, .reactivity, .flowSpeed:
             displayManager.applyBaseAppearanceToAll()
@@ -350,6 +378,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc private func accessibilityOptionsChanged() {
         displayManager.applyBaseAppearanceToAll()
         refreshStatus()
+    }
+
+    private func updateCodingSessionGlow() {
+        codingSessionGlow.update(enabled: settings.codingSessionGlow && settings.isEnabled)
+    }
+
+    // MARK: - Welcome tour
+
+    /// Opens the welcome tour — by itself on first launch, and from the menu or the popover.
+    private func showOnboarding() {
+        popover.performClose(nil)
+        userAskedToRetry()
+        statusModel.launchAtLoginError = nil
+        refreshStatus(includingPopoverDetails: true)
+        if onboarding == nil {
+            onboarding = OnboardingWindowController(settings: settings, status: statusModel, actions: OnboardingActions(
+                grantScreenRecording: { [weak self] in self?.grantAccess() },
+                openAutomationSettings: { [weak self] in self?.openAutomationSettings() },
+                setLaunchAtLogin: { [weak self] enabled in self?.setLaunchAtLogin(enabled) },
+                finish: { [weak self] in self?.onboardingFinished() }
+            ))
+        }
+        onboarding?.present()
+        // Permission and launch-at-login changes made in System Settings show up live in the tour.
+        onboardingRefreshTimer?.invalidate()
+        onboardingRefreshTimer = Timer.scheduledTimer(withTimeInterval: popoverRefreshInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshStatus() }
+        }
+    }
+
+    private func onboardingFinished() {
+        settings.hasCompletedOnboarding = true
+        onboardingRefreshTimer?.invalidate()
+        onboardingRefreshTimer = nil
+        refreshStatus()
+    }
+
+    private var isShowingOnboarding: Bool {
+        onboarding?.window?.isVisible == true
     }
 
     private func setLaunchAtLogin(_ enabled: Bool) {
@@ -378,7 +445,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func refreshStatus(includingPopoverDetails: Bool = false) {
         let status = musicSyncStatus()
         statusModel.musicSync = status
-        if includingPopoverDetails || popover.isShown {
+        if includingPopoverDetails || popover.isShown || isShowingOnboarding {
             statusModel.nowPlaying = colorCoordinator.nowPlaying
             statusModel.palette = colorCoordinator.effectivePalette
             statusModel.albumArtSource = colorCoordinator.albumArtSource
@@ -387,7 +454,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             statusModel.systemReducesMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         }
 
-        guard let button = statusItem.button else { return }
+        // While a timer runs, its countdown takes the icon's place.
+        guard let button = statusItem.button, !timers.isRunning else { return }
         let symbol: String
         let description: String
         switch status {
