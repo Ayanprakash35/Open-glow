@@ -12,12 +12,14 @@ enum GlowDefaults {
     static let softness: CGFloat = 0.3
 }
 
-/// Frame pacing.
+/// Frame pacing. How fast each kind of motion needs frames is `GlowMotion.frameRate`'s call.
 enum GlowFrameConfig {
-    /// While music is playing: smooth enough for quick swells.
-    static let musicFrameRate = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
-    /// While only the slow idle flow moves.
-    static let flowFrameRate = CAFrameRateRange(minimum: 15, maximum: 30, preferred: 30)
+    /// Frame rates the display link is asked for, fastest first: whole fractions of 60 and 120 Hz,
+    /// so each is met exactly. A request is rounded up to the next one.
+    static let rates: [Double] = [60, 30, 20, 15, 12, 10, 6, 4, 2]
+    /// Frames per second while Music Sync waits for audio with nothing else moving (Reduce
+    /// Motion), so music starting is noticed. Sane range: 4–20.
+    static let audioPollFrameRate: Double = 10
 }
 
 /// Configuration for the overlay window's stacking level.
@@ -34,14 +36,19 @@ enum WindowConfig {
 /// `GlowMotion` decides each moment's colors, brightness and widths around the perimeter;
 /// `EdgeLightRasterizer` turns them into four strip images (top, bottom, left, right), which this
 /// view shows as layer contents, scaled up smoothly. There are no masks, shadows or offscreen
-/// passes. One display link drives everything while anything moves, and stops when the glow
-/// holds still, so a steady glow costs nothing per frame.
+/// passes. One display link drives everything while anything moves, at the frame rate the motion
+/// needs (60 fps only for fast music swells and sweeps, ~20 for the idle flow, a few for a timer
+/// ring alone). It stops when the glow holds still or the window can't be seen (covered, screen
+/// locked or asleep), so a steady or hidden glow costs nothing per frame. Frames that would look
+/// exactly like the last one aren't committed.
 @MainActor
 final class GlowView: NSView {
     private let motion = GlowMotion()
     private let rasterizer = EdgeLightRasterizer()
     private var stripLayers: [CALayer] = []
     private var link: CADisplayLink?
+    /// The frame rate the link was asked for.
+    private var linkRate: Double = 0
     private var lastTimestamp: CFTimeInterval?
     private var audioSource: (() -> AudioAnalysisState)?
     private var audioActive = false
@@ -50,6 +57,7 @@ final class GlowView: NSView {
     private var colorSpace = EdgeLightRasterizer.Shape.sRGB
     private let logger = Logger(subsystem: "com.openglow.app", category: "GlowView")
     private var framesSinceReport = 0
+    private var presentsSinceReport = 0
     private var lastReport: CFTimeInterval = 0
 
     /// Peak opacity at the edge, 0...1.
@@ -123,11 +131,49 @@ final class GlowView: NSView {
         updateLink()
     }
 
+    /// Briefly takes on `palette` (sRGB): it sweeps in from the bottom center over the current
+    /// glow, flows for `GlowMotionConfig.accentHoldSeconds`, then cross-fades back to the current
+    /// palette (whatever it is by then). Calling again restarts it. With Reduce Motion it's a plain
+    /// cross-fade in and back. Skipped while the window can't be seen: it's a moment's notice.
+    func playAccent(_ palette: GlowPalette) {
+        guard isOnScreen else { return }
+        motion.playAccent(palette.converted(to: colorSpace))
+        updateLink()
+    }
+
+    /// Shows a visual timer: only `fraction` of the perimeter stays lit, clockwise from the top
+    /// center (1 = the whole edge, 0 = none), receding smoothly between updates — calling once a
+    /// second is plenty. nil removes the ring (it refills, then the normal glow carries on); pass
+    /// nil when the timer is cancelled or done.
+    func setTimerRing(remaining fraction: Double?) {
+        motion.setTimerRing(fraction)
+        if !isOnScreen { motion.settleTimerRing() }
+        updateLink()
+    }
+
+    /// The timer-finished flourish: three slow, soft pulses of the whole edge (about 2.5 s), then
+    /// the normal glow without a ring. While the window can't be seen, just the ring goes.
+    func playTimerFinished() {
+        if isOnScreen {
+            motion.playTimerFinished()
+        } else {
+            motion.setTimerRing(nil)
+            motion.settleTimerRing()
+        }
+        updateLink()
+    }
+
     /// Called whenever the overlay window is shown again.
     func didShow() {
         lastTimestamp = nil
         redraw()
         updateLink()
+        // Frames start once the window server reports the window visible; check again in case
+        // that report came before this call.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            self?.updateLink()
+        }
     }
 
     // MARK: - Layout
@@ -143,16 +189,39 @@ final class GlowView: NSView {
         withoutAnimation { stripLayers.forEach { $0.contentsScale = scale } }
     }
 
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        let center = NotificationCenter.default
+        if let window { center.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: window) }
+        if let newWindow {
+            center.addObserver(
+                self, selector: #selector(occlusionChanged), name: NSWindow.didChangeOcclusionStateNotification, object: newWindow
+            )
+        }
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         reshape()
-        if window == nil {
-            // The display link retains this view; don't let it outlive the window.
-            link?.invalidate()
-            link = nil
-        } else {
-            updateLink()
+        // Without a window this stops the link, which retains this view.
+        updateLink()
+    }
+
+    /// Whether any of the window shows: not ordered out, covered, on a locked screen or asleep.
+    private var isOnScreen: Bool {
+        guard let window else { return false }
+        return window.isVisible && window.occlusionState.contains(.visible)
+    }
+
+    @objc private func occlusionChanged(_ notification: Notification) {
+        logger.debug("Overlay visible: \(self.isOnScreen, privacy: .public)")
+        if isOnScreen {
+            // Time passed unseen: carry on from now, with the timer ring where it should be.
+            lastTimestamp = nil
+            motion.settleTimerRing()
+            redraw()
         }
+        updateLink()
     }
 
     /// Rebuilds the strips for the current size, notch, thickness, softness, reactivity and
@@ -176,6 +245,7 @@ final class GlowView: NSView {
             let geometry = EdgeGeometry(size: bounds.size, notch: notchGeometry)
             motion.perimeterPoints = Double(geometry.perimeter)
             motion.introOrigin = Double(geometry.point(at: CGPoint(x: bounds.midX, y: 0)).position)
+            motion.ringOrigin = Double(geometry.point(at: CGPoint(x: bounds.midX, y: bounds.maxY)).position)
             motion.horizontalFraction = (0..<motion.count).map {
                 Float(geometry.horizontalFraction(atPosition: CGFloat($0) / CGFloat(motion.count)))
             }
@@ -217,29 +287,45 @@ final class GlowView: NSView {
     }
 
     private func present() {
-        let images = rasterizer.render(motion, brightness: Float(brightness))
+        framesSinceReport += 1
+        // Nothing to commit when the light is exactly as last drawn.
+        guard let surfaces = rasterizer.render(motion, brightness: Float(brightness)) else { return }
+        presentsSinceReport += 1
         withoutAnimation {
-            for (layer, image) in zip(stripLayers, images) { layer.contents = image }
+            for (layer, surface) in zip(stripLayers, surfaces) { layer.contents = surface }
         }
     }
 
+    /// Starts, re-paces or stops the display link to match what the motion needs right now.
     private func updateLink() {
-        let wantsAudio = audioSource != nil && motionSettings.animation == .musicSync
-        let wantsFrames = window != nil
-            && (wantsAudio || motion.needsFrames(motionSettings, audioActive: audioActive))
-        if wantsFrames, link == nil {
+        var rate = isOnScreen ? motion.frameRate(motionSettings, audioActive: audioActive) : 0
+        if isOnScreen, audioSource != nil, motionSettings.animation == .musicSync {
+            rate = max(rate, GlowFrameConfig.audioPollFrameRate)
+        }
+        guard rate > 0 else {
+            link?.invalidate()
+            link = nil
+            linkRate = 0
+            return
+        }
+        let paced = GlowFrameConfig.rates.last { $0 >= rate } ?? GlowFrameConfig.rates.first ?? 60
+        if link == nil {
             let newLink = displayLink(target: self, selector: #selector(frame(_:)))
-            newLink.preferredFrameRateRange = GlowFrameConfig.flowFrameRate
             newLink.add(to: .main, forMode: .common)
             link = newLink
+            linkRate = 0
             lastTimestamp = nil
-        } else if !wantsFrames, let existing = link {
-            existing.invalidate()
-            link = nil
+        }
+        if paced != linkRate, let link {
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: Float(paced / 2), maximum: Float(paced), preferred: Float(paced))
+            linkRate = paced
         }
     }
 
     @objc private func frame(_ link: CADisplayLink) {
+        // The display may tick faster than asked (another window wants its full rate): only do
+        // the work this pace needs.
+        if let previous = lastTimestamp, link.timestamp - previous < 0.75 / max(linkRate, 1) { return }
         let previous = lastTimestamp
         lastTimestamp = link.timestamp
         let dt = previous.map { link.timestamp - $0 } ?? (link.targetTimestamp - link.timestamp)
@@ -247,27 +333,20 @@ final class GlowView: NSView {
         var audio: AudioAnalysisState?
         if motionSettings.animation == .musicSync, let source = audioSource {
             let state = source()
-            let active = state.hasAudio && !state.isSilent
-            if active != audioActive {
-                audioActive = active
-                link.preferredFrameRateRange = active ? GlowFrameConfig.musicFrameRate : GlowFrameConfig.flowFrameRate
-            }
+            audioActive = state.hasAudio && !state.isSilent
             audio = state
         }
         motion.step(dt: dt, audio: audio, settings: motionSettings)
         present()
-        framesSinceReport += 1
         if link.timestamp - lastReport >= 5 {
             if lastReport > 0 {
-                logger.debug("Drew \(self.framesSinceReport, privacy: .public) frames in \(link.timestamp - self.lastReport, format: .fixed(precision: 1), privacy: .public)s")
+                logger.debug("\(self.framesSinceReport, privacy: .public) frames, \(self.presentsSinceReport, privacy: .public) drawn in \(link.timestamp - self.lastReport, format: .fixed(precision: 1), privacy: .public)s at \(self.linkRate, format: .fixed(precision: 0), privacy: .public) fps")
             }
             framesSinceReport = 0
+            presentsSinceReport = 0
             lastReport = link.timestamp
         }
-        if !motion.needsFrames(motionSettings, audioActive: audioActive), audioSource == nil || motionSettings.animation != .musicSync {
-            link.invalidate()
-            self.link = nil
-        }
+        updateLink()
     }
 
     private func withoutAnimation(_ body: () -> Void) {

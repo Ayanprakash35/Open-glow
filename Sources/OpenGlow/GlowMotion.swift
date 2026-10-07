@@ -99,6 +99,41 @@ enum GlowMotionConfig {
     static let introHeadBoost: Float = 0.7
     /// The Reactivity setting (0...1) scales music by up to this factor; 0.5 gives the values above.
     static let maxReactivity: Float = 2
+
+    // MARK: Accent
+
+    /// Seconds for an accent's sweep: like the opening, from the bottom center up both sides,
+    /// over the current glow. Sane range: 0.6–2.5.
+    static let accentSweepSeconds: Double = 1.3
+    /// Seconds the accent colors flow once the sweep has met at the top. Sane range: 2–15.
+    static let accentHoldSeconds: Double = 5
+    /// Seconds to cross-fade back to the current palette (and, with Reduce Motion, to fade the
+    /// accent in). Sane range: 0.5–3.
+    static let accentFadeSeconds: Double = 1.2
+    /// Seconds for the sweep's bright head to fade once the fronts meet. Sane range: 0.2–1.5.
+    static let accentSettleSeconds: Double = 0.6
+    /// Extra brightness and width of the sweep's head. Sane range: 0–1.
+    static let accentHeadBoost: Float = 0.7
+
+    // MARK: Frame pacing
+
+    /// Frames per second the idle flow gets at Flow speed 1, scaled with the speed. The colors
+    /// drift slowly and their hand-overs are soft, so this is well below the display's rate.
+    /// Sane range: 15–30.
+    static let flowFrameRate: Double = 20
+    /// Slowest and fastest frame rates for the flow, whatever the speed. Sane ranges: 8–15, 20–60.
+    static let flowFrameRateRange: ClosedRange<Double> = 10...30
+    /// Music gets full frame rate while the swell changes faster than this (share of full per
+    /// second); otherwise half. Sane range: 0.2–1.5.
+    static let fastMusicRate: Float = 0.5
+    /// Seconds full frame rate is kept after the swell last changed fast: long enough for that
+    /// change to travel to the farthest point. Sane range: 0.5–1.5.
+    static let fastMusicHoldSeconds: Double = 0.8
+    /// Music's two frame rates. Sane ranges: 45–120 and 20–40.
+    static let fastMusicFrameRate: Double = 60
+    static let slowMusicFrameRate: Double = 30
+    /// Frame rate for cross-fades: palettes, music starting or stopping. Sane range: 20–60.
+    static let fadeFrameRate: Double = 30
 }
 
 /// The edge light's state from moment to moment: for every cell around the screen, its color,
@@ -135,6 +170,8 @@ final class GlowMotion {
     private var stereoRight: Float = 1
     private var history: [(time: Double, value: Float)] = []
     private var historyStart = 0
+    /// When the swell last changed fast, for the frame rate.
+    private var lastFastMusic = -Double.infinity
 
     private var fromPalette: GlowPalette
     private var toPalette: GlowPalette
@@ -142,12 +179,23 @@ final class GlowMotion {
     /// Opening sweep progress, 0...1; 1 when not playing.
     private var introProgress: Double = 1
 
-    /// Where the opening sweep starts: the middle of the bottom edge, as a position around the
-    /// screen. Set from the screen's geometry.
+    private var accent: GlowAccent
+    private var ring = TimerRing()
+
+    /// Where the opening sweep and accents start: the middle of the bottom edge, as a position
+    /// around the screen. Set from the screen's geometry.
     var introOrigin: Double = 0.625
-    /// Per-cell color field, and a sorted copy for finding the balance threshold.
+    /// Where the timer ring starts: the middle of the top edge. Set from the screen's geometry.
+    var ringOrigin: Double = 0.125
+    /// Per-cell color field, and scratch space for finding the balance threshold.
     private var colorField: [Float]
-    private var sortedField: [Float]
+    private var selectionScratch: [Float]
+    /// Per cell, cos and sin of 1, 2 and 3 times its angle around the screen: every per-cell wave
+    /// is then a few multiply-adds instead of a cosine.
+    private let harmonics: [SIMD8<Float>]
+    /// The envelope as it was `index × envelopeDelayStep` seconds ago, for this frame.
+    private var delayedEnvelope: [Float] = []
+    private let envelopeDelayStep = 1.0 / 240
 
     init(palette: GlowPalette = .fallback) {
         red = Array(repeating: 0, count: count)
@@ -157,7 +205,16 @@ final class GlowMotion {
         width = amplitude
         horizontalFraction = Array(repeating: 0.5, count: count)
         colorField = Array(repeating: 0, count: count)
-        sortedField = colorField
+        selectionScratch = colorField
+        let cells = count
+        harmonics = (0..<cells).map { i in
+            let a = 2 * Double.pi * Double(i) / Double(cells)
+            return SIMD8<Float>(
+                Float(cos(a)), Float(sin(a)), Float(cos(2 * a)), Float(sin(2 * a)),
+                Float(cos(3 * a)), Float(sin(3 * a)), 0, 0
+            )
+        }
+        accent = GlowAccent(count: cells)
         fromPalette = palette
         toPalette = palette
         history.reserveCapacity(256)
@@ -166,20 +223,67 @@ final class GlowMotion {
     var palette: GlowPalette { toPalette }
 
     /// Whether another frame would look different: false only when holding still with nothing
-    /// fading, so the display link can stop.
+    /// changing, so the display link can stop.
     func needsFrames(_ settings: GlowMotionSettings, audioActive: Bool) -> Bool {
-        if paletteProgress < 1 || introProgress < 1 { return true }
-        switch settings.animation {
-        case .steady: return musicMix > 0.001 || envelope > 0.001
-        case .flow: return !settings.reduceMotion || musicMix > 0.001
-        case .musicSync: return audioActive || !settings.reduceMotion || musicMix > 0.001 || envelope > 0.001
+        frameRate(settings, audioActive: audioActive) > 0
+    }
+
+    /// Frames per second needed for everything that's moving to look smooth; 0 when holding
+    /// still. Fast swells get the full rate, the slow flow and fades much less, and a timer ring
+    /// alone only as many as it takes to move about a point per frame.
+    func frameRate(_ settings: GlowMotionSettings, audioActive: Bool) -> Double {
+        let config = GlowMotionConfig.self
+        let moving = settings.animation != .steady && !settings.reduceMotion
+        var rate: Double = 0
+        if introProgress < 1 {
+            rate = settings.reduceMotion ? config.fadeFrameRate : config.fastMusicFrameRate
         }
+        if paletteProgress < 1 || (musicMix > 0.001 && musicMix < 0.999) {
+            rate = max(rate, config.fadeFrameRate)
+        }
+        let music = settings.animation == .musicSync && audioActive
+        if music {
+            let fast = time - lastFastMusic < config.fastMusicHoldSeconds
+            rate = max(rate, fast ? config.fastMusicFrameRate : config.slowMusicFrameRate)
+        } else if musicMix > 0.001 || envelope > 0.001 {
+            rate = max(rate, config.fadeFrameRate)
+        }
+        if moving {
+            let flow = config.flowFrameRate * settings.flowSpeed
+            rate = max(rate, min(max(flow, config.flowFrameRateRange.lowerBound), config.flowFrameRateRange.upperBound))
+        }
+        rate = max(rate, accent.frameRate(moving: moving || music))
+        return max(rate, ring.frameRate(perimeter: perimeterPoints ?? 5000))
     }
 
     /// Plays the opening sweep from the start.
     func startIntro() {
         introProgress = 0
     }
+
+    /// Sweeps `palette` in over the light, lets it flow for a while, then fades back to the
+    /// current palette. Starting another restarts it.
+    func playAccent(_ palette: GlowPalette) {
+        accent.start(palette)
+    }
+
+    /// Shows a timer ring with `fraction` (0...1) of the perimeter lit; nil removes it.
+    func setTimerRing(_ fraction: Double?) {
+        ring.set(fraction)
+    }
+
+    /// Plays the finish pulses and ends the ring.
+    func playTimerFinished() {
+        ring.finish()
+    }
+
+    /// Puts the ring where it's heading without easing, after time passed unseen.
+    func settleTimerRing() {
+        ring.settle()
+    }
+
+    /// The timer ring's shown remaining share (nil without a ring) — for tests.
+    var shownTimerRing: Double? { ring.shown }
 
     func setPalette(_ palette: GlowPalette, animated: Bool) {
         guard palette != toPalette else { return }
@@ -211,7 +315,9 @@ final class GlowMotion {
             stereoRight = approach(stereoRight, 1, seconds: 0.5, dt: dt)
         }
         let seconds = target > envelope ? config.envelopeAttackSeconds : config.envelopeReleaseSeconds
+        let before = envelope
         envelope = approach(envelope, target, seconds: seconds, dt: dt)
+        if dt > 0, abs(envelope - before) > config.fastMusicRate * Float(dt) { lastFastMusic = time }
         record(envelope)
         musicMix = approach(musicMix, audioActive ? 1 : 0, linearSeconds: config.musicBlendSeconds, dt: dt)
 
@@ -226,9 +332,13 @@ final class GlowMotion {
         if introProgress < 1 {
             introProgress = min(introProgress + dt / config.introSeconds, 1)
         }
+        accent.advance(dt: dt, origin: introOrigin, sweeping: !settings.reduceMotion)
+        ring.advance(dt: dt, perimeter: perimeterPoints ?? 5000)
 
         fill(settings: settings, moving: moving)
+        if accent.isActive { applyAccent() }
         if introProgress < 1 { applyIntro(sweeping: !settings.reduceMotion) }
+        ring.apply(amplitude: &amplitude, width: &width, origin: ringOrigin)
     }
 
     // MARK: - Fields
@@ -253,55 +363,136 @@ final class GlowMotion {
         let floor = min(max(1 - (1 - config.musicFloor) * reactivity, 0.03), 1)
         let widthGain = config.musicWidthGain * reactivity
         let breath = 1 - config.idleBreathDepth * 0.5 * (1 - Float(cos(2 * .pi * time / config.idleBreathSeconds)))
-        let travel = moving
         let mix = musicMix
         let stereo = settings.stereo && settings.animation == .musicSync
-
-        let flow = flowPhase
-        let wobble = wobblePhase * 2 * .pi
         let still = settings.animation == .steady || !moving
 
+        // Every per-cell wave is cos(k·θ + φ) for the cell's angle θ, expanded as
+        // cos(kθ)·cos φ − sin(kθ)·sin φ with this frame's phases φ worked out once, here.
+        let flow = 2 * Double.pi * flowPhase
+        let wobble = wobblePhase * 2 * .pi
+        func wave(_ phase: Double, weight: Double) -> (cos: Float, sin: Float) {
+            (Float(weight * cos(phase)), Float(weight * sin(phase)))
+        }
         // Color field: broad blobs, sliding with the flow and slowly changing shape. The primary
         // takes the cells above the field's (1 − balance) quantile, so it covers `balance` of the
         // edge whatever shape the blobs currently have.
+        let field1 = wave(flow, weight: 0.62)
+        let field2 = wave(2 * flow + wobble, weight: 0.25)
+        let field3 = wave(3 * flow - 1.7 * wobble + 1, weight: 0.13)
+        // Idle: soft brighter and dimmer patches drifting a little slower than the colors.
+        let patchFlow = 0.8 * flow
+        let patch2 = wave(2 * patchFlow - 0.8 * wobble + 2, weight: 0.6)
+        let patch3 = wave(3 * patchFlow + 1.3 * wobble, weight: 0.4)
+
         for i in 0..<count {
-            let a = 2 * Double.pi * (Double(i) / Double(count) + flow)
-            colorField[i] = Float(0.62 * cos(a) + 0.25 * cos(2 * a + wobble) + 0.13 * cos(3 * a - 1.7 * wobble + 1))
+            let h = harmonics[i]
+            colorField[i] = field1.cos * h[0] - field1.sin * h[1] + field2.cos * h[2] - field2.sin * h[3]
+                + field3.cos * h[4] - field3.sin * h[5]
         }
         let threshold = balanceThreshold(Float(min(max(palette.balance, 0), 1)))
 
-        for i in 0..<count {
-            let position = Double(i) / Double(count)
-            let primaryShare = smoothstep(threshold - softness, threshold + softness, colorField[i])
-            red[i] = s.0 + (p.0 - s.0) * primaryShare
-            green[i] = s.1 + (p.1 - s.1) * primaryShare
-            blue[i] = s.2 + (p.2 - s.2) * primaryShare
+        // Swells start at the origins, which drift with the colors, and travel outward both ways.
+        let travels = moving && perimeterPoints != nil
+        let origins = config.swellOrigins.map { origin in
+            let shifted = origin - flowPhase
+            return shifted - shifted.rounded(.down)
+        }
+        let delaySteps = (perimeterPoints ?? 0) / config.swellSpeed / envelopeDelayStep
+        if mix > 0, travels { resampleEnvelope(steps: 0.5 * delaySteps) }
+        let cells = count
+        let envelope = envelope
+        let stereoLeft = stereoLeft, stereoRight = stereoRight
 
-            // Idle: soft brighter and dimmer patches drifting a little slower than the colors.
-            let b = 2 * Double.pi * (position + 0.8 * flow)
-            let patch = Float(0.5 + 0.5 * (0.6 * cos(2 * b - 0.8 * wobble + 2) + 0.4 * cos(3 * b + 1.3 * wobble)))
-            let idleAmplitude = (1 - config.idlePatchDepth + config.idlePatchDepth * patch) * breath
-            let idleWidth = 1 + config.idleWidthDepth * (patch - 0.5)
+        // Straight through buffers: this runs for every cell, every frame.
+        harmonics.withUnsafeBufferPointer { harmonics in
+        colorField.withUnsafeBufferPointer { colorField in
+        red.withUnsafeMutableBufferPointer { red in
+        green.withUnsafeMutableBufferPointer { green in
+        blue.withUnsafeMutableBufferPointer { blue in
+        amplitude.withUnsafeMutableBufferPointer { amplitude in
+        width.withUnsafeMutableBufferPointer { width in
+            for i in 0..<cells {
+                let h = harmonics[i]
+                let primaryShare = smoothstep(threshold - softness, threshold + softness, colorField[i])
+                red[i] = s.0 + (p.0 - s.0) * primaryShare
+                green[i] = s.1 + (p.1 - s.1) * primaryShare
+                blue[i] = s.2 + (p.2 - s.2) * primaryShare
 
-            var musicAmplitude: Float = 0
-            var musicWidth: Float = 1
-            if mix > 0 {
-                let swell = travelledEnvelope(at: position, flow: flow, travel: travel)
-                var level = floor + (1 - floor) * swell * (0.8 + 0.2 * patch)
-                if stereo {
-                    let x = horizontalFraction[i]
-                    level *= max(stereoLeft + (stereoRight - stereoLeft) * x, config.stereoFloor)
+                let patch = 0.5 + 0.5 * (patch2.cos * h[2] - patch2.sin * h[3] + patch3.cos * h[4] - patch3.sin * h[5])
+                let idleAmplitude = (1 - config.idlePatchDepth + config.idlePatchDepth * patch) * breath
+                let idleWidth = 1 + config.idleWidthDepth * (patch - 0.5)
+
+                var musicAmplitude: Float = 0
+                var musicWidth: Float = 1
+                if mix > 0 {
+                    // The envelope as it arrives here, fading a little as it goes. Without
+                    // motion, every point sees it at once.
+                    var swell = envelope
+                    if travels {
+                        let position = Double(i) / Double(cells)
+                        var nearest = 1.0
+                        for origin in origins {
+                            let distance = abs(position - origin)
+                            nearest = min(nearest, distance, 1 - distance)
+                        }
+                        let fade = 1 - config.swellTravelFade * Float(min(nearest / 0.25, 1))
+                        swell = delayedEnvelope(steps: nearest * delaySteps) * fade
+                    }
+                    var level = floor + (1 - floor) * swell * (0.8 + 0.2 * patch)
+                    if stereo {
+                        let x = horizontalFraction[i]
+                        level *= max(stereoLeft + (stereoRight - stereoLeft) * x, config.stereoFloor)
+                    }
+                    musicAmplitude = level
+                    musicWidth = 1 + widthGain * swell
                 }
-                musicAmplitude = level
-                musicWidth = 1 + widthGain * swell
-            }
 
-            // Holding still shows the plain glow; otherwise the idle flow, blended toward the
-            // music swells while music plays.
-            let restAmplitude: Float = still ? 1 : idleAmplitude
-            let restWidth: Float = still ? 1 : idleWidth
-            amplitude[i] = restAmplitude + (musicAmplitude - restAmplitude) * mix
-            width[i] = max(restWidth + (musicWidth - restWidth) * mix, 1)
+                // Holding still shows the plain glow; otherwise the idle flow, blended toward the
+                // music swells while music plays.
+                let restAmplitude: Float = still ? 1 : idleAmplitude
+                let restWidth: Float = still ? 1 : idleWidth
+                amplitude[i] = restAmplitude + (musicAmplitude - restAmplitude) * mix
+                width[i] = max(restWidth + (musicWidth - restWidth) * mix, 1)
+            }
+        }}}}}}}
+    }
+
+    /// The accent's colors over the computed ones, cell by cell (over the accent it replaced, if
+    /// it's still sweeping in), plus its head.
+    private func applyAccent() {
+        guard let palette = accent.palette else { return }
+        let softness = GlowMotionConfig.colorSoftness
+        func colors(_ palette: GlowPalette) -> (threshold: Float, primary: SIMD3<Float>, secondary: SIMD3<Float>) {
+            (
+                balanceThreshold(Float(min(max(palette.balance, 0), 1))),
+                SIMD3(Float(palette.primary.red), Float(palette.primary.green), Float(palette.primary.blue)),
+                SIMD3(Float(palette.secondary.red), Float(palette.secondary.green), Float(palette.secondary.blue))
+            )
+        }
+        let current = colors(palette)
+        let previous = accent.previous.map(colors)
+        for i in 0..<count {
+            var color = SIMD3(red[i], green[i], blue[i])
+            if let previous, accent.previousShare[i] > 0 {
+                let share = smoothstep(previous.threshold - softness, previous.threshold + softness, colorField[i])
+                let accentColor = previous.secondary + (previous.primary - previous.secondary) * share
+                color += (accentColor - color) * accent.previousShare[i]
+            }
+            let mix = accent.share[i]
+            if mix > 0 {
+                let share = smoothstep(current.threshold - softness, current.threshold + softness, colorField[i])
+                let accentColor = current.secondary + (current.primary - current.secondary) * share
+                color += (accentColor - color) * mix
+            }
+            red[i] = color.x
+            green[i] = color.y
+            blue[i] = color.z
+            let head = accent.head[i]
+            if head > 0 {
+                amplitude[i] = min(amplitude[i] + head, 1)
+                width[i] += head
+            }
         }
     }
 
@@ -315,39 +506,17 @@ final class GlowMotion {
             for i in 0..<count { amplitude[i] *= fade }
             return
         }
-        // Fronts ease out as they climb; both reach the top (half way around) together.
-        let sweep = min(introProgress / config.introSweepShare, 1)
-        let front = 0.5 * (1 - pow(1 - sweep, 2.2))
-        let settle = max((introProgress - config.introSweepShare) / (1 - config.introSweepShare), 0)
-        let headStrength = config.introHeadBoost * Float(1 - smoothstep(0, 1, settle))
         let softness = config.introEdgeSoftness
+        let settle = max((introProgress - config.introSweepShare) / (1 - config.introSweepShare), 0)
+        let front = EdgeSweep.front(introProgress / config.introSweepShare, settle: settle, softness: softness)
+        let headStrength = config.introHeadBoost * Float(1 - smoothstep(0, 1, settle))
         for i in 0..<count {
-            let position = Double(i) / Double(count)
-            var distance = abs(position - introOrigin)
-            distance = min(distance, 1 - distance)
-            let lit = Float(1 - smoothstep(front - softness, front + softness, distance))
-            let offset = (distance - front) / (softness * 1.6)
-            let head = headStrength * Float(exp(-offset * offset)) * lit
-            amplitude[i] = min(amplitude[i] * lit + head, 1)
+            let distance = EdgeSweep.distance(Double(i) / Double(count), introOrigin)
+            let cell = EdgeSweep.cell(distance: distance, front: front, softness: softness)
+            let head = headStrength * cell.head
+            amplitude[i] = min(amplitude[i] * cell.lit + head, 1)
             width[i] += head
         }
-    }
-
-    /// The envelope as it arrives at `position`: swells start at the origins and travel outward
-    /// both ways, fading a little as they go. Without motion, every point sees it at once.
-    private func travelledEnvelope(at position: Double, flow: Double, travel: Bool) -> Float {
-        guard travel, let perimeter = perimeterPoints else { return envelope }
-        var nearest = 1.0
-        for origin in GlowMotionConfig.swellOrigins {
-            // The origins drift with the colors; distance is measured around the loop.
-            let shifted = origin - flow
-            let wrapped = shifted - shifted.rounded(.down)
-            let distance = abs(position - wrapped)
-            nearest = min(nearest, distance, 1 - distance)
-        }
-        let delay = nearest * perimeter / GlowMotionConfig.swellSpeed
-        let fade = 1 - GlowMotionConfig.swellTravelFade * Float(min(nearest / 0.25, 1))
-        return envelopeAt(time - delay) * fade
     }
 
     /// Perimeter in points, set from the screen geometry so swells travel at a real speed.
@@ -358,14 +527,40 @@ final class GlowMotion {
     private func balanceThreshold(_ balance: Float) -> Float {
         if balance >= 0.999 { return -.greatestFiniteMagnitude / 2 }
         if balance <= 0.001 { return .greatestFiniteMagnitude / 2 }
-        sortedField.withUnsafeMutableBufferPointer { sorted in
+        let rank = min(max(Int((1 - balance) * Float(count)), 0), count - 1)
+        let cells = count
+        return selectionScratch.withUnsafeMutableBufferPointer { scratch in
             colorField.withUnsafeBufferPointer { field in
-                sorted.baseAddress!.update(from: field.baseAddress!, count: count)
+                scratch.baseAddress!.update(from: field.baseAddress!, count: cells)
             }
-            sorted.sort()
+            return Self.select(rank, in: scratch)
         }
-        let index = min(max(Int((1 - balance) * Float(count)), 0), count - 1)
-        return sortedField[index]
+    }
+
+    /// The `rank`-th smallest of `values` (Hoare's quickselect), reordering them on the way.
+    private static func select(_ rank: Int, in values: UnsafeMutableBufferPointer<Float>) -> Float {
+        var low = 0, high = values.count - 1
+        while low < high {
+            let pivot = values[(low + high) / 2]
+            var i = low, j = high
+            while i <= j {
+                while values[i] < pivot { i += 1 }
+                while values[j] > pivot { j -= 1 }
+                if i <= j {
+                    values.swapAt(i, j)
+                    i += 1
+                    j -= 1
+                }
+            }
+            if rank <= j {
+                high = j
+            } else if rank >= i {
+                low = i
+            } else {
+                break
+            }
+        }
+        return values[rank]
     }
 
     // MARK: - Envelope history
@@ -382,17 +577,41 @@ final class GlowMotion {
         }
     }
 
-    private func envelopeAt(_ when: Double) -> Float {
-        guard historyStart < history.count else { return envelope }
-        if when <= history[historyStart].time { return history[historyStart].value }
-        // Newest first: most lookups are recent.
+    /// Samples the envelope history every `envelopeDelayStep` back from now, `steps` deep, so each
+    /// cell's delayed envelope is one interpolation instead of a search.
+    private func resampleEnvelope(steps: Double) {
+        let needed = Int(steps) + 2
+        if delayedEnvelope.count != needed { delayedEnvelope = Array(repeating: envelope, count: needed) }
+        guard historyStart < history.count else {
+            for k in 0..<needed { delayedEnvelope[k] = envelope }
+            return
+        }
+        // Each sample is further back, so the search only ever moves back through the history.
         var index = history.count - 1
-        while index > historyStart, history[index - 1].time > when { index -= 1 }
-        let newer = history[index]
-        let older = history[max(index - 1, historyStart)]
-        guard newer.time > older.time else { return newer.value }
-        let t = Float((when - older.time) / (newer.time - older.time))
-        return older.value + (newer.value - older.value) * min(max(t, 0), 1)
+        for k in 0..<needed {
+            let when = time - Double(k) * envelopeDelayStep
+            if when <= history[historyStart].time {
+                delayedEnvelope[k] = history[historyStart].value
+                continue
+            }
+            while index > historyStart, history[index - 1].time > when { index -= 1 }
+            let newer = history[index]
+            let older = history[max(index - 1, historyStart)]
+            guard newer.time > older.time else {
+                delayedEnvelope[k] = newer.value
+                continue
+            }
+            let t = Float((when - older.time) / (newer.time - older.time))
+            delayedEnvelope[k] = older.value + (newer.value - older.value) * min(max(t, 0), 1)
+        }
+    }
+
+    /// The envelope `steps` × `envelopeDelayStep` seconds ago, from this frame's samples.
+    private func delayedEnvelope(steps: Double) -> Float {
+        let last = delayedEnvelope.count - 1
+        let index = min(Int(steps), last - 1)
+        let t = Float(min(steps - Double(index), 1))
+        return delayedEnvelope[index] + (delayedEnvelope[index + 1] - delayedEnvelope[index]) * t
     }
 
     // MARK: - Helpers

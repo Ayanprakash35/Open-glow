@@ -80,8 +80,33 @@ struct EdgeLightPreviewTests {
                 intro.step(dt: 1 / fps, audio: nil, settings: flow)
                 elapsed += 1 / fps
             }
-            let context = try #require(compose(rasterizer, rasterizer.render(intro, brightness: brightness)))
+            _ = rasterizer.render(intro, brightness: brightness)
+            let context = try #require(compose(rasterizer, rasterizer.snapshot()))
             try write(context.makeImage(), "intro-\(String(format: "%.2f", target)).png")
+        }
+
+        // Effects: an accent sweeping in and holding, a timer ring, the finish pulses' peak.
+        let effects = GlowMotion(palette: PalettePresets.preset(withID: "ember").palette)
+        effects.perimeterPoints = Double(geometry.perimeter)
+        effects.introOrigin = intro.introOrigin
+        effects.ringOrigin = Double(geometry.point(at: CGPoint(x: size.width / 2, y: size.height)).position)
+        effects.playAccent(GlowPalette(
+            primary: PaletteColor(red: 0.85, green: 0.47, blue: 0.34), secondary: PaletteColor(red: 0.98, green: 0.8, blue: 0.6), balance: 0.5
+        ))
+        effects.setTimerRing(1)
+        var effectsTime = 0.0
+        let shots: [(Double, String, () -> Void)] = [
+            (0.6, "accent-sweep", {}), (3, "accent-hold", { effects.setTimerRing(0.6) }),
+            (12, "ring-0.60", { effects.playTimerFinished() }), (12.4, "finish-peak", {}),
+        ]
+        for (at, name, then) in shots {
+            while effectsTime < at - 1e-9 {
+                effects.step(dt: 1 / fps, audio: nil, settings: flow)
+                effectsTime += 1 / fps
+            }
+            _ = rasterizer.render(effects, brightness: brightness)
+            try write(try #require(compose(rasterizer, rasterizer.snapshot())).makeImage(), "\(name).png")
+            then()
         }
 
         // Time-vs-position strip: 12 s of idle flow, then 12 s of music.
@@ -97,9 +122,9 @@ struct EdgeLightPreviewTests {
             let isMusic = time >= 12
             motion.step(dt: row == 0 ? 0 : 1 / fps, audio: isMusic ? audio(at: time - 12) : nil, settings: isMusic ? music : flow)
             let started = Date()
-            let images = rasterizer.render(motion, brightness: brightness)
+            _ = rasterizer.render(motion, brightness: brightness)
             renderTimes.append(Date().timeIntervalSince(started))
-            let context = try #require(compose(rasterizer, images))
+            let context = try #require(compose(rasterizer, rasterizer.snapshot()))
             if [0, 6, 18, 18 + 0.33, 18 + 0.66].contains(where: { abs($0 - time) < 0.5 / fps }) {
                 try write(context.makeImage(), "frame-\(isMusic ? "music" : "flow")-\(String(format: "%05.2f", time)).png")
             }

@@ -1,9 +1,10 @@
+import Dispatch
 import os
 
 /// Single-producer/single-consumer stereo ring buffer for Float32 frames.
 ///
 /// The producer is the ScreenCaptureKit sample-delivery callback, a real-time-ish thread that must
-/// never allocate or block for long. The consumer is `BeatDetector`'s analysis timer, which wants
+/// never allocate or block for long. The consumer is `BeatDetector`'s analysis, which wants
 /// "the most recent N frames" each tick rather than a strict once-only dequeue.
 ///
 /// Both channels live under one lock so a read can never pair left and right from different
@@ -18,6 +19,10 @@ import os
 /// of `os_unfair_lock` isn't formally guaranteed to be), and uncontended it costs a few
 /// nanoseconds with no syscall. Copies are two contiguous `update(from:count:)` segments at most,
 /// not a per-sample loop.
+///
+/// A write observer lets the reader wake when audio lands instead of polling for it. Signalling
+/// it is a lock-free merge into a dispatch source, sent after the lock is released, so the
+/// producer still never blocks or allocates.
 final class AudioRingBuffer: @unchecked Sendable {
     let capacity: Int
     private let left: UnsafeMutablePointer<Float>
@@ -25,6 +30,9 @@ final class AudioRingBuffer: @unchecked Sendable {
     private var writeIndex = 0
     private var filledCount = 0
     private var totalWritten: UInt64 = 0
+    private var writeObserver: DispatchSourceUserDataAdd?
+    private var observerMinimumFrames = 1
+    private var framesSinceSignal = 0
     private let lock = OSAllocatedUnfairLock()
 
     init(capacity: Int) {
@@ -43,12 +51,37 @@ final class AudioRingBuffer: @unchecked Sendable {
 
     /// Appends `count` frames, overwriting the oldest on overflow rather than blocking — a full
     /// buffer means analysis fell behind, and dropping a few milliseconds of audio is far better
-    /// than stalling the capture thread.
+    /// than stalling the capture thread. Then signals the write observer, if one is due.
     func write(left leftSamples: UnsafePointer<Float>, right rightSamples: UnsafePointer<Float>, count: Int) {
         guard count > 0 else { return }
         lock.lock()
-        defer { lock.unlock() }
+        store(left: leftSamples, right: rightSamples, count: count)
+        var due: DispatchSourceUserDataAdd?
+        if let writeObserver {
+            framesSinceSignal += count
+            if framesSinceSignal >= observerMinimumFrames {
+                due = writeObserver
+                framesSinceSignal = 0
+            }
+        }
+        lock.unlock()
+        due?.add(data: 1)
+    }
 
+    /// Signals `observer` once at least `minimumFrames` frames have been written since it was
+    /// last signalled, so the reader can wake for each usable amount of new audio; nil stops the
+    /// signals. Pass a source on the reader's queue; signals coalesce while its handler is
+    /// pending, and a cancelled source ignores them.
+    func setWriteObserver(_ observer: DispatchSourceUserDataAdd?, minimumFrames: Int = 1) {
+        lock.lock()
+        defer { lock.unlock() }
+        writeObserver = observer
+        observerMinimumFrames = max(minimumFrames, 1)
+        framesSinceSignal = 0
+    }
+
+    /// Copies `count` frames in at the write position. Call with the lock held.
+    private func store(left leftSamples: UnsafePointer<Float>, right rightSamples: UnsafePointer<Float>, count: Int) {
         // Only the newest `capacity` frames can survive anyway.
         let skipped = max(0, count - capacity)
         var remaining = count - skipped
@@ -134,5 +167,6 @@ final class AudioRingBuffer: @unchecked Sendable {
         defer { lock.unlock() }
         writeIndex = 0
         filledCount = 0
+        framesSinceSignal = 0
     }
 }

@@ -101,8 +101,13 @@ enum EnvelopeConfig {
     /// arrived" must not look identical to "quiet music".
     static let noAudioWarningDelay: TimeInterval = 3.0
     /// Seconds between analysis ticks while nothing is playing. The ring buffer holds ~170ms,
-    /// so a 50ms poll can't miss audio resuming. Active ticks run at `FFTConfig.hopDuration`.
+    /// so a 50ms poll can't miss audio resuming. While music plays, each delivery of captured
+    /// audio triggers a tick instead (see `BeatDetector`).
     static let idlePollInterval: TimeInterval = 0.05
+    /// Seconds between backup ticks while music plays. Ticks then follow audio deliveries, so
+    /// these only notice a stalled capture (`staleAudioTimeout`), at most this much late.
+    /// Sane range: 0.05–0.15.
+    static let deliveryWatchdogInterval: TimeInterval = 0.1
 }
 
 /// Beat sizing: how big each detected beat looks, 0...1 (see `BeatSizer`). Large hits — accented
@@ -201,32 +206,30 @@ struct LoudnessRange {
 }
 
 /// Rolling history and adaptive threshold for one onset-strength signal.
+///
+/// The history is also kept sorted, updated in place as values arrive and expire (a binary search
+/// and a short shift each), so the median is a lookup rather than a sort or selection per hop.
 struct OnsetTrack {
     let margin: Float
+    /// The last `count` values in arrival order (a ring), so the one expiring is known.
     private var history: [Float]
-    private var sortScratch: [Float]
+    /// The same values ascending, in `sorted[0..<count]`.
+    private var sorted: [Float]
     private var index = 0
     private(set) var count = 0
 
     init(capacity: Int, margin: Float) {
         self.margin = margin
         history = [Float](repeating: 0, count: capacity)
-        sortScratch = history
+        sorted = history
     }
 
     /// Median of the history (call before appending the current value), or nil until a few hops
     /// of history exist — so capture starting mid-song doesn't read as a beat.
-    mutating func median() -> Float? {
+    func median() -> Float? {
         guard count >= 8 else { return nil }
         let n = count
-        history.withUnsafeBufferPointer { source in
-            sortScratch.withUnsafeMutableBufferPointer { scratch in
-                scratch.baseAddress!.update(from: source.baseAddress!, count: n)
-                var window = UnsafeMutableBufferPointer(rebasing: scratch[0..<n])
-                window.sort()
-            }
-        }
-        return n % 2 == 1 ? sortScratch[n / 2] : (sortScratch[n / 2 - 1] + sortScratch[n / 2]) / 2
+        return n % 2 == 1 ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2
     }
 
     /// Whether `value` clears the adaptive threshold: `median` (from `median()`) plus the margin.
@@ -236,14 +239,43 @@ struct OnsetTrack {
     }
 
     mutating func append(_ value: Float) {
+        // NaN (only from non-finite audio) would break the ordering the binary searches rely on.
+        let value = value.isNaN ? Float.infinity : value
+        let capacity = history.count
+        let n = count
+        sorted.withUnsafeMutableBufferPointer { buffer in
+            let s = buffer.baseAddress!
+            var end = n
+            if n == capacity {
+                // Drop the value about to be overwritten: any copy of it will do.
+                let removed = Self.firstIndex(notBelow: history[index], in: s, count: n)
+                (s + removed).update(from: s + removed + 1, count: n - removed - 1)
+                end -= 1
+            }
+            let insertion = Self.firstIndex(notBelow: value, in: s, count: end)
+            (s + insertion + 1).update(from: s + insertion, count: end - insertion)
+            s[insertion] = value
+        }
         history[index] = value
-        index = (index + 1) % history.count
-        count = min(count + 1, history.count)
+        index = (index + 1) % capacity
+        count = min(n + 1, capacity)
     }
 
     mutating func clear() {
         index = 0
         count = 0
+    }
+
+    /// Lower bound: the first position in the ascending `values[0..<count]` holding `value` or
+    /// more (`count` if none).
+    private static func firstIndex(notBelow value: Float, in values: UnsafePointer<Float>, count: Int) -> Int {
+        var low = 0
+        var high = count
+        while low < high {
+            let middle = (low + high) / 2
+            if values[middle] < value { low = middle + 1 } else { high = middle }
+        }
+        return low
     }
 }
 
@@ -315,13 +347,18 @@ struct BeatSizer {
     }
 }
 
-/// Reads captured audio from the ring buffer on its own timer, runs an FFT band/beat analysis
-/// on every 512-sample hop, and publishes a smoothed `AudioAnalysisState` for the renderer.
+/// Reads captured audio from the ring buffer, runs an FFT band/beat analysis on every 512-sample
+/// hop, and publishes a smoothed `AudioAnalysisState` for the renderer.
+///
+/// While music plays, the ring buffer wakes the analysis as each capture delivery lands (≈47 a
+/// second, two hops each), so a hit is analyzed as soon as it arrives and nothing wakes up just
+/// to find no new audio; a slow watchdog timer notices the deliveries stopping. Otherwise (no
+/// audio yet, silence, a stalled stream) a 50ms timer polls.
 ///
 /// Analysis runs on its own serial queue; each overlay's display link reads the latest snapshot
 /// at the display's refresh rate. All mutable state here is touched only on `analysisQueue` —
 /// `start()`, `stop()` and `restartSession()` hop onto it too — so a tick still running from a
-/// cancelled timer can never overlap a new session. The snapshot has its own lock because the
+/// cancelled source can never overlap a new session. The snapshot has its own lock because the
 /// main actor reads it.
 ///
 /// Beat detection is a log-magnitude onset detector (after SuperFlux): each bin's rise over the
@@ -343,7 +380,9 @@ final class BeatDetector: @unchecked Sendable {
     private let analysisQueue = DispatchQueue(label: "com.openglow.audio.analysis", qos: .userInitiated)
     private let published = OSAllocatedUnfairLock(initialState: AudioAnalysisState())
     private var timer: DispatchSourceTimer?
-    private var timerInterval: TimeInterval = 0
+    /// Signalled by the ring buffer when new audio lands, while `followsDeliveries`.
+    private var deliveries: DispatchSourceUserDataAdd?
+    private var followsDeliveries = false
 
     // FFT setup and scratch, allocated once.
     private let fftSetup: FFTSetup
@@ -426,6 +465,10 @@ final class BeatDetector: @unchecked Sendable {
     }
 
     deinit {
+        if let deliveries {
+            ringBuffer.setWriteObserver(nil)
+            deliveries.cancel()
+        }
         timer?.cancel()
         vDSP_destroy_fftsetup(fftSetup)
     }
@@ -441,10 +484,16 @@ final class BeatDetector: @unchecked Sendable {
             source.setEventHandler { [weak self] in
                 self?.tick()
             }
+            let arrivals = DispatchSource.makeUserDataAddSource(queue: analysisQueue)
+            arrivals.setEventHandler { [weak self] in
+                self?.tick()
+            }
             timer = source
-            timerInterval = 0
-            setTimerInterval(EnvelopeConfig.idlePollInterval)
+            deliveries = arrivals
+            followsDeliveries = false
+            Self.schedule(source, followingDeliveries: false)
             source.resume()
+            arrivals.resume()
             logger.notice("Beat detector started")
         }
     }
@@ -452,6 +501,9 @@ final class BeatDetector: @unchecked Sendable {
     func stop() {
         analysisQueue.async { [self] in
             guard let timer else { return }
+            ringBuffer.setWriteObserver(nil)
+            deliveries?.cancel()
+            deliveries = nil
             timer.cancel()
             self.timer = nil
             beginSession(now: ProcessInfo.processInfo.systemUptime)
@@ -504,15 +556,20 @@ final class BeatDetector: @unchecked Sendable {
 
     private func tick() {
         process(now: ProcessInfo.processInfo.systemUptime)
-        let active = hasAudio && !isStale && !snapshot().isSilent
-        setTimerInterval(active ? FFTConfig.hopDuration : EnvelopeConfig.idlePollInterval)
+        setFollowsDeliveries(hasAudio && !isStale && !wasSilent)
     }
 
-    private func setTimerInterval(_ interval: TimeInterval) {
-        guard let timer, interval != timerInterval else { return }
-        timerInterval = interval
-        let leeway: DispatchTimeInterval = interval < 0.02 ? .milliseconds(2) : .milliseconds(15)
-        timer.schedule(deadline: .now() + interval, repeating: interval, leeway: leeway)
+    /// Switches between ticking on each audio delivery (with a slow watchdog timer) and polling.
+    private func setFollowsDeliveries(_ follow: Bool) {
+        guard follow != followsDeliveries, let timer else { return }
+        followsDeliveries = follow
+        ringBuffer.setWriteObserver(follow ? deliveries : nil, minimumFrames: FFTConfig.hopSize)
+        Self.schedule(timer, followingDeliveries: follow)
+    }
+
+    private static func schedule(_ timer: DispatchSourceTimer, followingDeliveries: Bool) {
+        let interval = followingDeliveries ? EnvelopeConfig.deliveryWatchdogInterval : EnvelopeConfig.idlePollInterval
+        timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(15))
     }
 
     /// One analysis tick at wall-clock time `now`: analyzes every hop that has arrived since the
@@ -610,14 +667,16 @@ final class BeatDetector: @unchecked Sendable {
         if gateOpen {
             computePowerSpectrum()
 
-            let bandDb = [bandPower(bassBins), bandPower(midBins), bandPower(trebleBins)].map { 10 * log10f(max($0, 1e-12)) }
+            let bassDb = Self.decibels(bandPower(bassBins))
+            let midDb = Self.decibels(bandPower(midBins))
+            let trebleDb = Self.decibels(bandPower(trebleBins))
             let decay = EnvelopeConfig.loudnessCeilingDecayDbPerSecond * Float(dt)
             let loudestCeiling = max(bassRange.ceiling, midRange.ceiling, trebleRange.ceiling)
-            let loudest = max(bandDb.max() ?? -200, loudestCeiling - decay)
+            let loudest = max(bassDb, midDb, trebleDb, loudestCeiling - decay)
             let minimumFloor = loudest - EnvelopeConfig.bandRelativeFloorDb
-            bass = bassRange.normalize(db: bandDb[0], dt: Float(dt), minimumFloor: minimumFloor)
-            mid = midRange.normalize(db: bandDb[1], dt: Float(dt), minimumFloor: minimumFloor)
-            treble = trebleRange.normalize(db: bandDb[2], dt: Float(dt), minimumFloor: minimumFloor)
+            bass = bassRange.normalize(db: bassDb, dt: Float(dt), minimumFloor: minimumFloor)
+            mid = midRange.normalize(db: midDb, dt: Float(dt), minimumFloor: minimumFloor)
+            treble = trebleRange.normalize(db: trebleDb, dt: Float(dt), minimumFloor: minimumFloor)
 
             // Stereo levels share one linear peak so each edge's brightness keeps its balance
             // relative to the other.
@@ -698,9 +757,6 @@ final class BeatDetector: @unchecked Sendable {
     private func computePowerSpectrum() {
         let n = vDSP_Length(FFTConfig.windowSize)
         let half = vDSP_Length(halfSize)
-        power.withUnsafeMutableBufferPointer { total in
-            vDSP_vclr(total.baseAddress!, 1, half)
-        }
         for channel in 0..<2 {
             let source = channel == 0 ? leftSamples : rightSamples
             source.withUnsafeBufferPointer { samples in
@@ -718,16 +774,24 @@ final class BeatDetector: @unchecked Sendable {
                             vDSP_ctoz(complex, 2, &split, 1, half)
                         }
                         vDSP_fft_zrip(fftSetup, &split, 1, FFTConfig.log2Size, FFTRadix(FFT_FORWARD))
-                        channelPower.withUnsafeMutableBufferPointer { out in
-                            vDSP_zvmags(&split, 1, out.baseAddress!, 1, half)
+                        // The left channel's power goes straight into the total; the right's is
+                        // added below.
+                        if channel == 0 {
+                            power.withUnsafeMutableBufferPointer { total in
+                                vDSP_zvmags(&split, 1, total.baseAddress!, 1, half)
+                            }
+                        } else {
+                            channelPower.withUnsafeMutableBufferPointer { out in
+                                vDSP_zvmags(&split, 1, out.baseAddress!, 1, half)
+                            }
                         }
                     }
                 }
             }
-            channelPower.withUnsafeBufferPointer { channelOut in
-                power.withUnsafeMutableBufferPointer { total in
-                    vDSP_vadd(total.baseAddress!, 1, channelOut.baseAddress!, 1, total.baseAddress!, 1, half)
-                }
+        }
+        channelPower.withUnsafeBufferPointer { right in
+            power.withUnsafeMutableBufferPointer { total in
+                vDSP_vadd(total.baseAddress!, 1, right.baseAddress!, 1, total.baseAddress!, 1, half)
             }
         }
     }
@@ -848,24 +912,38 @@ final class BeatDetector: @unchecked Sendable {
     private static func medianChange(
         _ current: UnsafePointer<Float>, _ reference: UnsafePointer<Float>, count: Int, scratch: UnsafeMutableBufferPointer<Float>
     ) -> Float {
-        for i in 0..<count { scratch[i] = current[i] - reference[i] }
-        var sorted = UnsafeMutableBufferPointer(rebasing: scratch[0..<count])
-        sorted.sort()
-        return count % 2 == 1 ? sorted[count / 2] : (sorted[count / 2 - 1] + sorted[count / 2]) / 2
+        vDSP_vsub(reference, 1, current, 1, scratch.baseAddress!, 1, vDSP_Length(count))
+        return Median.reordering(UnsafeMutableBufferPointer(rebasing: scratch[0..<count]))
     }
 
     /// For each bin in `range`: how far it rose above the reference frame's ±1-bin neighborhood
-    /// (so vibrato and slowly beating partials don't count), minus `gain`, floored at 0.
+    /// (so vibrato and slowly beating partials don't count), minus `gain`, floored at 0. `range`
+    /// must lie within `0..<count`.
     private static func maxFilteredRise(
         _ current: UnsafePointer<Float>, _ reference: UnsafePointer<Float>,
         range: Range<Int>, count: Int, gain: Float, into out: UnsafeMutablePointer<Float>
     ) {
-        for i in range {
-            var neighborhood = reference[i]
-            if i > 0 { neighborhood = max(neighborhood, reference[i - 1]) }
-            if i < count - 1 { neighborhood = max(neighborhood, reference[i + 1]) }
-            out[i] = max(current[i] - neighborhood - gain, 0)
+        guard !range.isEmpty else { return }
+        let low = range.lowerBound
+        let high = range.upperBound
+        // Neighborhood max in `out`: each bin with the one above it (the top bin has none), then
+        // with the one below it (the bottom bin has none).
+        let pairedAbove = min(high, count - 1) - low
+        if pairedAbove > 0 {
+            vDSP_vmax(reference + low, 1, reference + low + 1, 1, out + low, 1, vDSP_Length(pairedAbove))
         }
+        if high == count { out[count - 1] = reference[count - 1] }
+        let firstWithBelow = max(low, 1)
+        if high > firstWithBelow {
+            vDSP_vmax(out + firstWithBelow, 1, reference + firstWithBelow - 1, 1, out + firstWithBelow, 1, vDSP_Length(high - firstWithBelow))
+        }
+        // current - neighborhood - gain, floored at 0.
+        let n = vDSP_Length(high - low)
+        var negativeGain = -gain
+        var zero: Float = 0
+        vDSP_vsub(out + low, 1, current + low, 1, out + low, 1, n)
+        vDSP_vsadd(out + low, 1, &negativeGain, out + low, 1, n)
+        vDSP_vthr(out + low, 1, &zero, out + low, 1, n)
     }
 
     private func clearOnsetHistory() {
@@ -883,6 +961,10 @@ final class BeatDetector: @unchecked Sendable {
             vDSP_sve(p.baseAddress! + bins.lowerBound, 1, &sum, vDSP_Length(bins.count))
         }
         return sum
+    }
+
+    private static func decibels(_ power: Float) -> Float {
+        10 * log10f(max(power, 1e-12))
     }
 
     private func publish(_ state: AudioAnalysisState) {

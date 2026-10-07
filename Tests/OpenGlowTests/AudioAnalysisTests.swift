@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import os
 @testable import OpenGlow
 
 /// Deterministic noise so the tests are reproducible run to run.
@@ -108,12 +109,15 @@ private enum Synth {
 }
 
 /// Feeds audio into a real ring buffer the way ScreenCaptureKit does — fixed-size chunks at real
-/// time pace, with some delivery jitter — while ticking a real `BeatDetector` on simulated time.
+/// time pace, with some delivery jitter — while ticking a real `BeatDetector` on simulated time:
+/// on a fixed timer, or (`ticksOnDelivery`) right after each delivery, as the app does while
+/// music plays.
 private final class AnalysisHarness {
     let ring = AudioRingBuffer(capacity: AudioEngineConfig.ringBufferCapacity)
     let detector: BeatDetector
     let chunk: Int
     let tickInterval: Double
+    let ticksOnDelivery: Bool
     private var jitter = NoiseGenerator(state: 99)
     private(set) var time: Double = 0
     private(set) var frames: [(time: Double, state: AudioAnalysisState)] = []
@@ -125,9 +129,10 @@ private final class AnalysisHarness {
     private(set) var beatStrengths: [Float] = []
     private var lastBeatCount = 0
 
-    init(chunk: Int = 1024, tickInterval: Double = FFTConfig.hopDuration) {
+    init(chunk: Int = 1024, tickInterval: Double = FFTConfig.hopDuration, ticksOnDelivery: Bool = false) {
         self.chunk = chunk
         self.tickInterval = tickInterval
+        self.ticksOnDelivery = ticksOnDelivery
         detector = BeatDetector(ringBuffer: ring)
         detector.beginSession(now: 0)
     }
@@ -141,16 +146,22 @@ private final class AnalysisHarness {
         precondition(left.count == right.count)
         let start = time
         var fed = 0
+        if ticksOnDelivery {
+            while fed < left.count {
+                let n = min(chunk, left.count - fed)
+                time = max(time, start + Double(fed + n) / Synth.rate + Double(jitter.next()) * 0.004)
+                write(left, right, from: fed, count: n)
+                fed += n
+                tick()
+            }
+            return segmentStart
+        }
         var nextArrival = start + Double(min(chunk, left.count)) / Synth.rate + Double(jitter.next()) * 0.004
         while fed < left.count {
             time += tickInterval + Double(jitter.next()) * 0.002
             while fed < left.count && nextArrival <= time {
                 let n = min(chunk, left.count - fed)
-                left.withUnsafeBufferPointer { l in
-                    right.withUnsafeBufferPointer { r in
-                        ring.write(left: l.baseAddress! + fed, right: r.baseAddress! + fed, count: n)
-                    }
-                }
+                write(left, right, from: fed, count: n)
                 fed += n
                 let upcoming = min(chunk, left.count - fed)
                 nextArrival = start + Double(fed + upcoming) / Synth.rate + Double(jitter.next()) * 0.004
@@ -158,6 +169,14 @@ private final class AnalysisHarness {
             tick()
         }
         return segmentStart
+    }
+
+    private func write(_ left: [Float], _ right: [Float], from: Int, count: Int) {
+        left.withUnsafeBufferPointer { l in
+            right.withUnsafeBufferPointer { r in
+                ring.write(left: l.baseAddress! + from, right: r.baseAddress! + from, count: count)
+            }
+        }
     }
 
     /// Advances time with no new audio at all, as when capture stalls or stops delivering.
@@ -268,6 +287,39 @@ struct AudioRingBufferTests {
         }
         #expect(available == 4)
         #expect(out == [6, 7, 8, 9])
+    }
+
+    /// The observer is signalled once per `minimumFrames` written (not per write), never once
+    /// removed, and a reset starts the count over.
+    @Test func signalsTheWriteObserver() async throws {
+        let ring = AudioRingBuffer(capacity: 4096)
+        let queue = DispatchQueue(label: "test.ring.observer")
+        let signals = OSAllocatedUnfairLock(initialState: 0)
+        let observer = DispatchSource.makeUserDataAddSource(queue: queue)
+        observer.setEventHandler { signals.withLock { $0 += Int(observer.data) } }
+        observer.resume()
+        defer { observer.cancel() }
+        let samples = [Float](repeating: 0.5, count: 1024)
+        func write(_ count: Int) {
+            samples.withUnsafeBufferPointer { s in ring.write(left: s.baseAddress!, right: s.baseAddress!, count: count) }
+        }
+        func settledSignals() async throws -> Int {
+            try await Task.sleep(for: .milliseconds(100))
+            return queue.sync { signals.withLock { $0 } }
+        }
+
+        write(1024)  // no observer yet
+        ring.setWriteObserver(observer, minimumFrames: 512)
+        write(1024)  // signal
+        write(300)
+        write(300)  // 600 since the last signal: signal
+        write(300)
+        ring.reset()
+        write(300)  // 300 since the reset
+        #expect(try await settledSignals() == 2)
+        ring.setWriteObserver(nil)
+        write(1024)
+        #expect(try await settledSignals() == 2)
     }
 
     @Test func resetEmptiesButSequenceKeepsCounting() {
@@ -546,6 +598,24 @@ struct BeatDetectorTests {
 
 @Suite("Beat sizing")
 struct BeatSizingTests {
+    /// Analysis is per hop, so ticking once per delivery (as the app does while music plays)
+    /// fires the same beats at the same sizes, and ends in the same state, as ticking every hop.
+    @Test(arguments: chunkSizes)
+    func deliveryTicksMatchHopTicks(chunk: Int) {
+        let loop = Synth.drumLoop(seconds: 8, kickGains: [1, 0.25, 0.6])
+        let audio = Synth.mix(loop.samples, Synth.pad(seconds: 8, rms: 0.05))
+        let byHop = AnalysisHarness(chunk: chunk)
+        let byDelivery = AnalysisHarness(chunk: chunk, ticksOnDelivery: true)
+        for harness in [byHop, byDelivery] {
+            harness.play(audio)
+            harness.play(Synth.scaled(audio, by: 0.3))
+        }
+        let kicks = loop.kickTimes + loop.kickTimes.map { $0 + 8 }
+        #expect(byDelivery.detector.beatCount == byHop.detector.beatCount)
+        #expect(byDelivery.sizes(of: kicks) == byHop.sizes(of: kicks))
+        #expect(byDelivery.detector.snapshot() == byHop.detector.snapshot())
+    }
+
     /// Alternating accented and ghost kicks (12 dB apart) at a steady tempo: the accents burst,
     /// the ghost kicks only nudge the glow.
     @Test func accentedKicksAreGraded() {

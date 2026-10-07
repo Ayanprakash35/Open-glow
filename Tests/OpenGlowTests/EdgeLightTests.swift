@@ -66,7 +66,8 @@ struct EdgeLightTests {
     private func render(_ motion: GlowMotion, size: CGSize = CGSize(width: 1200, height: 800)) -> (EdgeLightRasterizer, [CGImage?]) {
         let rasterizer = EdgeLightRasterizer()
         rasterizer.configure(.init(size: size, notch: nil, falloff: 11, softness: 0.3, maximumWidth: 2.1), cells: motion.count)
-        return (rasterizer, rasterizer.render(motion, brightness: 1))
+        #expect(rasterizer.render(motion, brightness: 1)?.count == rasterizer.strips.count)
+        return (rasterizer, rasterizer.snapshot())
     }
 
     private func alphaColumn(_ image: CGImage, column: Int) -> [UInt8] {
@@ -78,14 +79,78 @@ struct EdgeLightTests {
         let motion = GlowMotion()
         motion.step(dt: 0, audio: nil, settings: GlowMotionSettings(animation: .steady))
         let (rasterizer, images) = render(motion)
-        let bottom = try #require(images[1])
-        // Bottom strip: image row 0 is its top (innermost), the last row is the screen edge.
+        // The zone holding the bottom edge's middle: its image's row 0 is the innermost, the last
+        // row the screen edge.
+        let index = try #require(rasterizer.strips.firstIndex { $0.frame.minY == 0 && $0.frame.contains(CGPoint(x: 600, y: 1)) })
+        let bottom = try #require(images[index])
         let alphas = alphaColumn(bottom, column: bottom.width / 2).reversed()
         let values = Array(alphas)
         #expect(values[0] > 200, "the edge itself is near full brightness")
         #expect(zip(values, values.dropFirst()).allSatisfy { $0 >= $1 }, "never brighter further in")
         #expect(values.last == 0, "the strip's inner edge is fully faded")
-        #expect(rasterizer.strips.count == 4)
+    }
+
+    @Test func zonesTileTheBorder() {
+        let motion = GlowMotion()
+        let rasterizer = EdgeLightRasterizer()
+        let size = CGSize(width: 1710, height: 1112)
+        let notch = NotchGeometry(leftEdgeX: 755, rightEdgeX: 955, bottomY: 1080)
+        rasterizer.configure(.init(size: size, notch: notch, falloff: 10, softness: 0.3, maximumWidth: 2.1), cells: motion.count)
+        // Four corners, the notch, the two sides and the edges between corners and notch.
+        let strips = rasterizer.strips
+        #expect(strips.count == 10)
+        // Along the top and the bottom, zones follow each other edge to edge without gaps.
+        for row in [strips.filter { $0.frame.minY == 0 }, strips.filter { $0.frame.maxY == size.height }] {
+            let spans = row.map(\.frame).sorted { $0.minX < $1.minX }
+            #expect(spans.first?.minX == 0 && spans.last?.maxX == size.width)
+            for (a, b) in zip(spans, spans.dropFirst()) { #expect(abs(a.maxX - b.minX) < 0.001) }
+        }
+        // Edge zones have one cell per perimeter cell along the edge.
+        let perimeterCell = EdgeGeometry(size: size, notch: notch).perimeter / CGFloat(motion.count)
+        let bottomMiddle = strips.first { $0.frame.minY == 0 && $0.frame.contains(CGPoint(x: 855, y: 1)) }
+        #expect(abs((bottomMiddle?.frame.width ?? 0) / CGFloat(bottomMiddle?.columns ?? 1) - perimeterCell) < 0.5)
+        #expect(strips.reduce(0) { $0 + $1.pixel.count } < 45_000, "far fewer cells than a square grid (~96k)")
+    }
+
+    @Test func framesAlternateBuffersAndSkipWhenUnchanged() throws {
+        let motion = GlowMotion()
+        let settings = GlowMotionSettings(animation: .flow)
+        motion.step(dt: 0, audio: nil, settings: settings)
+        let (rasterizer, _) = render(motion)
+        #expect(rasterizer.render(motion, brightness: 1) == nil, "nothing changed, nothing to show")
+        let first = try #require(rasterizer.snapshot().first ?? nil)
+        motion.step(dt: 0.05, audio: nil, settings: settings)
+        let a = try #require(rasterizer.render(motion, brightness: 1))
+        motion.step(dt: 0.05, audio: nil, settings: settings)
+        let b = try #require(rasterizer.render(motion, brightness: 1))
+        #expect(a[0] !== b[0], "never drawn into the buffer on screen")
+        #expect(rasterizer.snapshot().first??.dataProvider?.data != first.dataProvider?.data)
+    }
+
+    @Test func onlyCellsInReachAreDrawnAndTheRestIsCleared() throws {
+        let settings = GlowMotionSettings(animation: .steady)
+        let wide = GlowMotion()
+        wide.setTimerRing(0)
+        wide.step(dt: 0, audio: nil, settings: settings)
+        wide.setTimerRing(1)
+        wide.playTimerFinished()
+        // Mid-pulse the glow is half again as wide; afterwards it's back to the plain glow.
+        for _ in 0..<14 { wide.step(dt: 1.0 / 30, audio: nil, settings: settings) }
+        let rasterizer = EdgeLightRasterizer()
+        rasterizer.configure(.init(size: CGSize(width: 1200, height: 800), notch: nil, falloff: 11, softness: 0.3, maximumWidth: 2.1), cells: wide.count)
+        _ = rasterizer.render(wide, brightness: 1)
+        let wideCells = rasterizer.lastCellCount
+        wide.step(dt: 1.0 / 30, audio: nil, settings: settings)
+        _ = rasterizer.render(wide, brightness: 1)
+        for _ in 0..<90 { wide.step(dt: 1.0 / 30, audio: nil, settings: settings) }
+        _ = rasterizer.render(wide, brightness: 0.99)
+        _ = rasterizer.render(wide, brightness: 1)
+        #expect(rasterizer.lastCellCount < wideCells, "a narrower glow visits fewer cells")
+        let reused = rasterizer.snapshot()
+        let (_, fresh) = render(wide)
+        for (a, b) in zip(reused, fresh) {
+            #expect(a?.dataProvider?.data == b?.dataProvider?.data, "what the wider frame lit further in is dark again")
+        }
     }
 
     @Test func middleOfTheScreenIsNeverLit() {

@@ -50,7 +50,8 @@ struct ReadmeImageTests {
             motion.step(dt: dt, audio: audio?(time), settings: settings)
             time += dt
         }
-        let images = rasterizer.render(motion, brightness: brightness)
+        _ = rasterizer.render(motion, brightness: brightness)
+        let images = rasterizer.snapshot()
         let context = try #require(CGContext(
             data: nil, width: Int(size.width), height: Int(size.height), bitsPerComponent: 8, bytesPerRow: 0,
             space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
