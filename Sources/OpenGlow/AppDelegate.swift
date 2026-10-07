@@ -2,19 +2,13 @@ import AppKit
 import SwiftUI
 import os
 
-/// Retry schedule, in seconds, after capture fails to start or stops unexpectedly. The last
-/// value repeats for further attempts.
-private let captureRestartDelays: [Double] = [1, 2, 5, 10]
-
-/// A stream that ran at least this long before stopping counts as healthy: the retry schedule
-/// starts over rather than continuing to back off.
-private let healthyCaptureDuration: TimeInterval = 30
-
 /// How often the open popover refreshes its status, in seconds.
 private let popoverRefreshInterval: TimeInterval = 0.5
 
-/// How often the menu-bar icon re-checks Music Sync while capture runs, in seconds (1–5). Catches
-/// problems no event announces — buffers arriving unreadable — without the popover open.
+/// How often Music Sync is re-checked while capture runs, in seconds. Catches what no event
+/// announces — access revoked in System Settings, a capture display gone without a stream error —
+/// and keeps the menu-bar icon current without the popover open. Each check is one privacy-service
+/// preflight query. Sane range: 1–5.
 private let capturingStatusRefreshInterval: TimeInterval = 2
 
 @MainActor
@@ -30,12 +24,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var colorCoordinator: ColorCoordinator!
     private var audioEngine: AudioEngine!
     private var beatDetector: BeatDetector!
+    private var sessionMonitor: ScreenSessionMonitor!
 
-    private var isDisplayAsleep = false
     private var isSyncingAudio = false
     private var loggedMissingPermission = false
-    private var restartAttempts = 0
+    private var retry = CaptureRetry()
     private var pendingRestart: Task<Void, Never>?
+    /// The next check for Screen Recording access while Music Sync waits for it.
+    private var permissionWatch: Timer?
+    private var permissionChecks = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Menu-bar-only: no Dock icon, no app switcher entry. Set at runtime (rather than relying
@@ -49,6 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Everything `refreshStatus()` reads exists before anything below can trigger it.
         audioEngine = AudioEngine()
         beatDetector = BeatDetector(ringBuffer: audioEngine.ringBuffer)
+        sessionMonitor = ScreenSessionMonitor()
         displayManager = DisplayManager()
         colorCoordinator = ColorCoordinator(settings: settings, displayManager: displayManager)
 
@@ -56,22 +54,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         displayManager.onDisplaysChanged = { [weak self] in self?.reconcileAudio() }
         colorCoordinator.onChange = { [weak self] in self?.refreshStatus() }
         colorCoordinator.update(animated: false)
+        // Launched while locked or switched out: nothing shows, and no sweep plays, until that ends.
+        displayManager.isSuspended = sessionMonitor.isPaused
         displayManager.playIntro()
 
-        audioEngine.onUnexpectedStop = { [weak self] stoppedByUser, ranFor in
-            self?.captureStoppedUnexpectedly(byUser: stoppedByUser, ranFor: ranFor)
+        audioEngine.onUnexpectedStop = { [weak self] cause, ranFor in
+            self?.captureStopped(cause, ranFor: ranFor)
         }
-        audioEngine.onStartFailed = { [weak self] in
-            self?.captureStoppedUnexpectedly(byUser: false, ranFor: 0)
+        audioEngine.onStartFailed = { [weak self] cause in
+            self?.captureStopped(cause, ranFor: 0)
         }
         audioEngine.onStateChange = { [weak self] in self?.captureStateChanged() }
+        sessionMonitor.onChange = { [weak self] old, new in self?.sessionChanged(from: old, to: new) }
 
         settings.onChange = { [weak self] change in self?.settingsChanged(change) }
 
-        let workspaceCenter = NSWorkspace.shared.notificationCenter
-        workspaceCenter.addObserver(self, selector: #selector(displaysDidSleep), name: NSWorkspace.screensDidSleepNotification, object: nil)
-        workspaceCenter.addObserver(self, selector: #selector(displaysDidWake), name: NSWorkspace.screensDidWakeNotification, object: nil)
-        workspaceCenter.addObserver(
+        NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(accessibilityOptionsChanged),
             name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil
         )
@@ -116,6 +114,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc private func statusItemClicked(_ sender: NSStatusItem?) {
         guard let event = NSApp.currentEvent else { return }
+        // A click proves the screen is awake and unlocked, whatever notifications were missed.
+        sessionMonitor.handle(.userInteracted)
         // Control-click is the secondary click for one-button mice and for people who turned
         // secondary click off; it must reach the menu (and Quit) too.
         if event.type == .rightMouseUp || event.modifierFlags.contains(.control) {
@@ -133,7 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         // Opening the popover is the primary click, so it re-checks too — a grant made in
         // System Settings should take effect here, not only from the right-click menu.
-        reconcileAudio()
+        userAskedToRetry()
         statusModel.launchAtLoginError = nil
         refreshStatus(includingPopoverDetails: true)
         // An accessory app isn't activated by a click on its status item, and an inactive app's
@@ -179,9 +179,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
 
         // There's no notification when access changes in System Settings, so every menu open
-        // re-checks. That works because `checkPermission()` is a live query as long as the app
-        // never calls CGRequestScreenCaptureAccess (see AudioEngine).
-        reconcileAudio()
+        // re-checks (as does a slow timer while access is missing). That works because
+        // `checkPermission()` is a live query as long as the app never calls
+        // CGRequestScreenCaptureAccess (see AudioEngine).
+        userAskedToRetry()
 
         let menu = NSMenu()
 
@@ -323,7 +324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if settings.isEnabled { displayManager.playIntro() }
             reconcileAudio()
         case .animationMode:
-            restartAttempts = 0
+            retry.reset()
             displayManager.applyBaseAppearanceToAll()
             reconcileAudio()
         case .displays:
@@ -359,20 +360,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // MARK: - Status
 
     private func musicSyncStatus() -> MusicSyncStatus {
-        guard displayManager.hasVisibleOverlay else { return .off }
-        guard settings.animationMode == .musicSync else { return .steady }
-        guard audioEngine.permissionState == .granted else { return .needsPermission }
-        if audioEngine.isCapturing {
-            let snapshot = beatDetector.snapshot()
-            if !snapshot.hasAudio && audioEngine.droppedBufferCount > 0 {
-                return .captureUnreadable
-            }
-            return .listening(receivingAudio: snapshot.hasAudio && !snapshot.isSilent)
-        }
-        if !audioEngine.isStarting, let failure = audioEngine.lastFailure {
-            return .captureFailed(reason: failure.hasSuffix(".") ? failure : failure + ".")
-        }
-        return .starting
+        let capture: MusicSyncStatus.Capture = audioEngine.isCapturing
+            ? .running(audioEngine.captureHealth)
+            : .notRunning(lastFailure: audioEngine.lastFailure)
+        return .resolve(
+            overlayVisible: displayManager.hasVisibleOverlay,
+            musicSyncSelected: settings.animationMode == .musicSync,
+            permission: audioEngine.permissionState,
+            capture: capture,
+            reportsFailure: retry.reportsFailure,
+            analysis: beatDetector.snapshot()
+        )
     }
 
     /// Updates the status icon and the popover's live state. The popover's details are only
@@ -423,7 +421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.performClose(nil)
         Task {
             await audioEngine.registerForScreenRecording()
-            reconcileAudio()
+            userAskedToRetry()
             if audioEngine.permissionState != .granted {
                 openPrivacySettings()
             }
@@ -463,13 +461,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // MARK: - Audio lifecycle
 
     /// Keeps the icon in step with capture: every transition refreshes it, and while capture runs
-    /// a slow timer re-checks for problems that arrive without a transition.
+    /// a slow timer re-checks for problems that arrive without a transition — access revoked in
+    /// System Settings (a stream doesn't always stop when it is) among them.
     private func captureStateChanged() {
         refreshStatus()
         if audioEngine.isCapturing {
             guard capturingStatusTimer == nil else { return }
             let timer = Timer.scheduledTimer(withTimeInterval: capturingStatusRefreshInterval, repeats: true) { [weak self] _ in
-                MainActor.assumeIsolated { self?.refreshStatus() }
+                MainActor.assumeIsolated { self?.reconcileAudio() }
             }
             timer.tolerance = capturingStatusRefreshInterval / 2
             capturingStatusTimer = timer
@@ -479,71 +478,118 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    @objc private func displaysDidSleep() {
-        isDisplayAsleep = true
+    /// Sleep, the lock screen, the screen saver or user switching began or ended: overlays hide
+    /// and capture stops while any holds, and everything comes back as it was — no opening sweep —
+    /// once none does.
+    private func sessionChanged(from old: SessionPauseReasons, to new: SessionPauseReasons) {
+        displayManager.isSuspended = !new.isEmpty
+        if !old.isEmpty, new.isEmpty {
+            // Whatever failed before the pause gets a fresh retry schedule.
+            retry.reset()
+        }
         reconcileAudio()
     }
 
-    @objc private func displaysDidWake() {
-        isDisplayAsleep = false
-        restartAttempts = 0
+    /// The user is looking at Music Sync's state (menu, popover, Grant Access): anything held back
+    /// until they act gets one more try, and access checks start quick again.
+    private func userAskedToRetry() {
+        audioEngine.allowRetryAfterRefusal()
+        stopPermissionWatch()
+        // Someone looking at a failure shouldn't wait out the rest of the backoff.
+        pendingRestart?.cancel()
+        pendingRestart = nil
         reconcileAudio()
     }
 
-    private func captureStoppedUnexpectedly(byUser: Bool, ranFor: TimeInterval) {
-        if byUser {
+    private func captureStopped(_ cause: CaptureStopCause, ranFor: TimeInterval) {
+        switch cause {
+        case .userStopped:
             // Stopped from the system's capture indicator: respect that rather than restarting.
             logger.notice("Capture stopped from the system indicator; switching to Flow")
             settings.animationMode = .flow
             return
+        case .accessDenied:
+            // The engine now treats access as missing: reconciling shows the warning and watches
+            // for a grant instead of retrying.
+            reconcileAudio()
+            return
+        case .failed, .unreadable:
+            // Access revoked in System Settings doesn't always surface as a refusal; the live
+            // check tells, and retrying without access would only fail again.
+            guard audioEngine.checkPermission() == .granted else {
+                reconcileAudio()
+                return
+            }
         }
-        if ranFor >= healthyCaptureDuration {
-            restartAttempts = 0
-        }
-        let delay = captureRestartDelays[min(restartAttempts, captureRestartDelays.count - 1)]
-        restartAttempts += 1
-        logger.notice("Retrying capture in \(delay, privacy: .public)s (attempt \(self.restartAttempts, privacy: .public))")
-        refreshStatus()
+        let delay = retry.next(afterRunningFor: ranFor)
+        logger.notice("Retrying capture in \(delay, privacy: .public)s (attempt \(self.retry.attempts, privacy: .public))")
         pendingRestart?.cancel()
         pendingRestart = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled else { return }
+            self?.pendingRestart = nil
             self?.reconcileAudio()
         }
+        refreshStatus()
     }
 
     /// Makes capture, analysis and the per-display animation match the current state — on/off,
-    /// visible displays, mode, permission and display sleep. Safe to call any number of times.
+    /// visible displays, mode, permission, sleep and lock, and the display capture is tied to.
+    /// Safe to call any number of times.
     private func reconcileAudio() {
         defer { refreshStatus() }
-        let wantsMusic = settings.animationMode == .musicSync
-            && !isDisplayAsleep
-            && displayManager.hasVisibleOverlay
-        guard wantsMusic else {
+        let decision = MusicSyncPlan.decide(
+            musicSyncSelected: settings.animationMode == .musicSync,
+            overlayVisible: displayManager.hasVisibleOverlay,
+            paused: sessionMonitor.isPaused,
+            permission: audioEngine.checkPermission(),
+            engine: engineState()
+        )
+        switch decision {
+        case .off:
+            stopPermissionWatch()
             stopAudioSync()
-            return
-        }
-        guard audioEngine.checkPermission() == .granted else {
+        case .awaitingPermission:
             if !loggedMissingPermission {
                 loggedMissingPermission = true
-                logger.error("Music Sync is on but Screen & System Audio Recording access isn't granted (preflight false); showing the steady glow")
+                logger.error("Music Sync is on but Screen & System Audio Recording access isn't granted; showing the steady glow")
             }
             stopAudioSync()
-            return
+            watchPermission()
+        case .run(let step):
+            stopPermissionWatch()
+            loggedMissingPermission = false
+            runAudioSync(step)
         }
-        loggedMissingPermission = false
+    }
 
+    private func engineState() -> MusicSyncPlan.Engine {
+        if audioEngine.isStarting { return .starting }
+        guard audioEngine.isCapturing else { return pendingRestart == nil ? .idle : .waitingToRetry }
+        let onConnectedDisplay = audioEngine.captureDisplayID.map(DisplayManager.isOnline) ?? true
+        return .running(onConnectedDisplay: onConnectedDisplay)
+    }
+
+    private func runAudioSync(_ step: MusicSyncPlan.Step) {
+        let detectorWasRunning = isSyncingAudio
         if !isSyncingAudio {
             isSyncingAudio = true
             beatDetector.start()
             let detector: BeatDetector = beatDetector
             displayManager.startAudioFrames { detector.snapshot() }
-        } else if !audioEngine.isCapturing && !audioEngine.isStarting {
+        }
+        switch step {
+        case .keep:
+            break
+        case .start:
             // Capture is restarting under a running detector: give it a fresh session so its
             // "no audio yet" check and onset history describe the new stream.
+            if detectorWasRunning { beatDetector.restartSession() }
+            audioEngine.start()
+        case .restart:
+            logger.notice("The display audio capture was attached to is gone; restarting capture")
+            audioEngine.stop()
             beatDetector.restartSession()
-        }
-        if !audioEngine.isCapturing && !audioEngine.isStarting {
             audioEngine.start()
         }
     }
@@ -553,11 +599,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         pendingRestart = nil
         // A deliberate stop ends any failure episode: the next start gets a fresh retry schedule
         // (and `stop()` clears the failure the status would otherwise keep showing).
-        restartAttempts = 0
+        retry.reset()
         audioEngine.stop()
         guard isSyncingAudio else { return }
         isSyncingAudio = false
         displayManager.stopAudioFrames()
         beatDetector.stop()
+    }
+
+    /// Re-checks access after a delay that grows from quick (just after the user acted, or right
+    /// after access went missing) to slow.
+    private func watchPermission() {
+        guard permissionWatch == nil else { return }
+        let delay = CaptureRetryConfig.delay(CaptureRetryConfig.permissionCheckDelays, attempt: permissionChecks)
+        permissionChecks += 1
+        let timer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.permissionWatch = nil
+                self?.reconcileAudio()
+            }
+        }
+        timer.tolerance = delay / 4
+        permissionWatch = timer
+    }
+
+    private func stopPermissionWatch() {
+        permissionWatch?.invalidate()
+        permissionWatch = nil
+        permissionChecks = 0
     }
 }

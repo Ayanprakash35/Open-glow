@@ -9,14 +9,52 @@ enum MusicSyncStatus: Equatable {
     case starting
     case listening(receivingAudio: Bool)
     case captureFailed(reason: String)
-    /// Capture is running and delivering buffers, but none of them can be read. Retrying the same
-    /// stream won't help, so this doesn't claim to.
+    /// Capture delivers buffers, but none of them can be read — and fresh streams didn't help.
     case captureUnreadable
 
     var needsAttention: Bool {
         switch self {
         case .needsPermission, .captureFailed, .captureUnreadable: true
         default: false
+        }
+    }
+
+    /// Where capture stands, for `resolve`.
+    enum Capture: Equatable {
+        /// Idle, starting, or waiting to retry; `lastFailure` is why it last failed, nil after a
+        /// deliberate stop.
+        case notRunning(lastFailure: CaptureFailure?)
+        case running(CaptureHealth)
+    }
+
+    /// The status everything adds up to. A capture failure only shows once a retry has failed
+    /// too (`reportsFailure`), and then keeps showing while the next retry starts: a stream that
+    /// drops once and comes back reads as starting, and one that keeps failing doesn't flicker.
+    static func resolve(
+        overlayVisible: Bool,
+        musicSyncSelected: Bool,
+        permission: AudioEngine.PermissionState,
+        capture: Capture,
+        reportsFailure: Bool,
+        analysis: AudioAnalysisState
+    ) -> MusicSyncStatus {
+        guard overlayVisible else { return .off }
+        guard musicSyncSelected else { return .steady }
+        guard permission == .granted else { return .needsPermission }
+        switch capture {
+        case .running(let health):
+            // Judged on the latest buffers only: one bad buffer long ago, followed by silence,
+            // isn't a broken capture — and silence itself never is.
+            if health.isUnreadable { return .captureUnreadable }
+            return .listening(receivingAudio: analysis.hasAudio && !analysis.isSilent)
+        case .notRunning(let failure):
+            guard let failure, reportsFailure else { return .starting }
+            switch failure.cause {
+            case .unreadable: return .captureUnreadable
+            case .failed, .accessDenied, .userStopped:
+                let reason = failure.reason
+                return .captureFailed(reason: reason.hasSuffix(".") ? reason : reason + ".")
+            }
         }
     }
 }

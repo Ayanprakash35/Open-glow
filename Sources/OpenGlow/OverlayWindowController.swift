@@ -66,12 +66,27 @@ final class OverlayWindowController: NSWindowController {
     }
 
     func show() {
+        glowView.isHidden = false
         window?.orderFrontRegardless()
         glowView.didShow()
     }
 
+    /// Hiding the view as well as the window is what pauses its display link: AppKit documents
+    /// that a view's link doesn't fire while the view is hidden. Anything that moves meanwhile (a
+    /// palette cross-fade) carries on from where it was when the overlay shows again.
     func hide() {
         window?.orderOut(nil)
+        glowView.isHidden = true
+    }
+
+    /// For a display that's gone: hides the window and takes the view out of it, which ends the
+    /// view's display link — the link retains the view and would otherwise keep it, and its
+    /// frames, alive with the window.
+    func tearDown() {
+        glowView.stopAudioFrames()
+        hide()
+        window?.contentView = nil
+        close()
     }
 
     /// Called when this same physical display's frame/resolution/scaling changes (still the same
@@ -100,6 +115,18 @@ final class OverlayWindowController: NSWindowController {
 
     func playIntro() {
         glowView.playIntro()
+    }
+
+    func playAccent(_ palette: GlowPalette) {
+        glowView.playAccent(palette)
+    }
+
+    func setTimerRing(remaining fraction: Double?) {
+        glowView.setTimerRing(remaining: fraction)
+    }
+
+    func playTimerFinished() {
+        glowView.playTimerFinished()
     }
 
     /// Music Sync on: this overlay's view animates from `source` on its own display link.

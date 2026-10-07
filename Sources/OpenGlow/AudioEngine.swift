@@ -14,10 +14,14 @@ enum AudioEngineConfig {
     /// Log a repeating per-buffer failure on its first occurrence and then once every this many
     /// occurrences, so a persistent problem is visible without flooding the log at ~47 Hz.
     static let failureLogInterval = 500
+    /// Unreadable buffers in a row after which the stream counts as broken rather than unlucky
+    /// and is given up for a fresh one. ScreenCaptureKit delivers about 50 buffers a second, so 25
+    /// is half a second of audio. Sane range: 5–100.
+    static let unreadableBufferRun = 25
 }
 
 /// Captures system audio output — never the microphone — via ScreenCaptureKit and feeds 48kHz
-/// stereo Float32 frames into `ringBuffer`, which `BeatDetector` reads on its own timer.
+/// stereo Float32 frames into `ringBuffer`, which `BeatDetector` reads as audio arrives (polling while idle).
 ///
 /// ScreenCaptureKit over CoreAudio process taps: both need the same Screen & System Audio
 /// Recording permission, and taps would mean hand-building an aggregate-device dictionary and
@@ -47,7 +51,7 @@ final class AudioEngine: NSObject {
     private enum Lifecycle {
         case idle
         case starting(generation: Int, stream: SCStream?, processor: AudioSampleProcessor?)
-        case running(SCStream, processor: AudioSampleProcessor, generation: Int, since: TimeInterval)
+        case running(SCStream, processor: AudioSampleProcessor, display: CGDirectDisplayID, since: TimeInterval)
     }
 
     private let logger = Logger(subsystem: "com.openglow.app", category: "AudioEngine")
@@ -60,27 +64,33 @@ final class AudioEngine: NSObject {
     let ringBuffer = AudioRingBuffer(capacity: AudioEngineConfig.ringBufferCapacity)
 
     private(set) var permissionState: PermissionState = .unknown
+    private var access = CaptureAccess()
 
     /// Called on the main actor after every lifecycle change: starting, running, stopped, failed.
     var onStateChange: (() -> Void)?
 
     /// Called on the main actor when a starting or running stream stops without being asked to:
-    /// whether the user stopped it from the system's capture indicator, and how long it had been
-    /// running (0 if it never finished starting).
-    var onUnexpectedStop: ((_ stoppedByUser: Bool, _ ranFor: TimeInterval) -> Void)?
+    /// why, and how long it had been running (0 if it never finished starting).
+    var onUnexpectedStop: ((_ cause: CaptureStopCause, _ ranFor: TimeInterval) -> Void)?
 
     /// Called on the main actor when `start()` fails (as opposed to being superseded by `stop()`).
-    var onStartFailed: (() -> Void)?
+    var onStartFailed: ((_ cause: CaptureStopCause) -> Void)?
 
-    /// Why capture most recently failed to start or stopped unexpectedly; nil once it's running,
-    /// and after a deliberate `stop()`.
-    private(set) var lastFailure: String?
+    /// Why capture most recently failed to start or stopped unexpectedly. Kept while a retry
+    /// starts; nil once capture runs, and after a deliberate `stop()`.
+    private(set) var lastFailure: CaptureFailure?
 
-    /// Buffers the running stream delivered that couldn't be read — nonzero with no audio reaching
-    /// analysis means capture is broken, not that nothing is playing.
-    var droppedBufferCount: Int {
-        if case .running(_, let processor, _, _) = lifecycle { return processor.droppedBufferCount }
-        return 0
+    /// How readable the running stream's buffers are; all zero when not running.
+    var captureHealth: CaptureHealth {
+        if case .running(_, let processor, _, _) = lifecycle { return processor.health }
+        return CaptureHealth()
+    }
+
+    /// The display the running stream's content filter is tied to. ScreenCaptureKit needs one
+    /// even for audio, so the stream is restarted when that display goes away.
+    var captureDisplayID: CGDirectDisplayID? {
+        if case .running(_, _, let display, _) = lifecycle { return display }
+        return nil
     }
 
     var isCapturing: Bool {
@@ -97,12 +107,17 @@ final class AudioEngine: NSObject {
     /// service on every call — but only as long as `CGRequestScreenCaptureAccess` is never called
     /// in this process: after that call, macOS caches its answer for the rest of the process's
     /// life and this would keep returning it even after the user grants access. So this app
-    /// never calls it.
+    /// never calls it. A refusal from ScreenCaptureKit itself overrules a yes (see `CaptureAccess`).
     @discardableResult
     func checkPermission() -> PermissionState {
-        let granted = CGPreflightScreenCaptureAccess()
-        permissionState = granted ? .granted : .denied
+        permissionState = access.evaluate(preflight: CGPreflightScreenCaptureAccess())
         return permissionState
+    }
+
+    /// The user asked to try again: a refusal from ScreenCaptureKit no longer holds back the next
+    /// `start()`.
+    func allowRetryAfterRefusal() {
+        access.userRetried()
     }
 
     /// Asks ScreenCaptureKit for shareable content once. When access is undecided this makes
@@ -142,7 +157,7 @@ final class AudioEngine: NSObject {
             let mainDisplayID = CGMainDisplayID()
             guard let display = content.displays.first(where: { $0.displayID == mainDisplayID }) ?? content.displays.first else {
                 logger.error("Capture not started: SCShareableContent returned no displays")
-                failStart(myGeneration, reason: "No display is available to attach audio capture to.")
+                failStart(myGeneration, CaptureFailure(cause: .failed, reason: "No display is available to attach audio capture to."))
                 return
             }
             let filter = SCContentFilter(display: display, excludingWindows: [])
@@ -163,10 +178,13 @@ final class AudioEngine: NSObject {
 
             guard let targetFormat = AVAudioFormat(standardFormatWithSampleRate: AudioEngineConfig.targetSampleRate, channels: 2) else {
                 logger.error("Capture not started: could not build the 48kHz stereo target format")
-                failStart(myGeneration, reason: "The audio format couldn't be set up.")
+                failStart(myGeneration, CaptureFailure(cause: .failed, reason: "The audio format couldn't be set up."))
                 return
             }
-            let processor = AudioSampleProcessor(ringBuffer: ringBuffer, targetFormat: targetFormat)
+            let processor = AudioSampleProcessor(ringBuffer: ringBuffer, targetFormat: targetFormat) { [weak self] processor in
+                let id = ObjectIdentifier(processor)
+                Task { @MainActor in self?.abandonUnreadableStream(processorID: id) }
+            }
             let stream = SCStream(filter: filter, configuration: config, delegate: self)
             lifecycle = .starting(generation: myGeneration, stream: stream, processor: processor)
 
@@ -182,24 +200,32 @@ final class AudioEngine: NSObject {
                 try? await stream.stopCapture()
                 return
             }
-            lifecycle = .running(stream, processor: processor, generation: myGeneration, since: ProcessInfo.processInfo.systemUptime)
+            lifecycle = .running(stream, processor: processor, display: display.displayID, since: ProcessInfo.processInfo.systemUptime)
             lastFailure = nil
             logger.notice("Audio capture started on display \(display.displayID, privacy: .public)")
             onStateChange?()
         } catch {
             logger.error("Capture failed to start: \(error.localizedDescription, privacy: .public)")
-            failStart(myGeneration, reason: error.localizedDescription)
+            failStart(myGeneration, CaptureFailure(cause: .classify(error), reason: error.localizedDescription))
         }
     }
 
     /// Ends a start that failed on its own. A start that `stop()` superseded ends quietly.
-    private func failStart(_ generation: Int, reason: String) {
+    private func failStart(_ generation: Int, _ failure: CaptureFailure) {
         guard isStillStarting(generation) else { return }
         if case .starting(_, _, let processor) = lifecycle { processor?.cancel() }
         lifecycle = .idle
-        lastFailure = reason
+        lastFailure = failure
+        noteRefusal(failure.cause)
         onStateChange?()
-        onStartFailed?()
+        onStartFailed?(failure.cause)
+    }
+
+    private func noteRefusal(_ cause: CaptureStopCause) {
+        guard cause == .accessDenied else { return }
+        access.captureRefused()
+        permissionState = .denied
+        logger.error("ScreenCaptureKit refused capture: Screen & System Audio Recording access is missing")
     }
 
     /// Stops capture and returns at once, already `.idle`; the stream finishes stopping in the
@@ -236,7 +262,7 @@ final class AudioEngine: NSObject {
         return false
     }
 
-    fileprivate func handleStreamStopped(_ streamID: ObjectIdentifier, stoppedByUser: Bool, reason: String) {
+    fileprivate func handleStreamStopped(_ streamID: ObjectIdentifier, _ failure: CaptureFailure) {
         let processor: AudioSampleProcessor?
         let ranFor: TimeInterval
         switch lifecycle {
@@ -252,24 +278,55 @@ final class AudioEngine: NSObject {
             // A late callback for an old stream must not tear down a newer one.
             return
         }
+        streamEnded(processor: processor, ranFor: ranFor, failure)
+    }
+
+    /// The stream whose processor is `processorID` delivers only buffers that can't be read — a
+    /// format the converter can't take, typically after an output-device change. Gives it up like
+    /// a stream that stopped, so the app's retry starts a fresh one that negotiates its format anew.
+    private func abandonUnreadableStream(processorID: ObjectIdentifier) {
+        let processor: AudioSampleProcessor
+        let ranFor: TimeInterval
+        switch lifecycle {
+        case .running(let stream, let running, _, let since) where ObjectIdentifier(running) == processorID:
+            processor = running
+            ranFor = ProcessInfo.processInfo.systemUptime - since
+            Task { [logger] in
+                do {
+                    try await stream.stopCapture()
+                } catch {
+                    logger.error("Unreadable capture did not stop cleanly: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+        case .starting(_, _, let starting?) where ObjectIdentifier(starting) == processorID:
+            // The in-flight start sees the generation change and stops the stream itself.
+            processor = starting
+            ranFor = 0
+        default:
+            return
+        }
+        streamEnded(processor: processor, ranFor: ranFor, CaptureFailure(cause: .unreadable, reason: "macOS delivered audio Open Glow couldn't read."))
+    }
+
+    private func streamEnded(processor: AudioSampleProcessor?, ranFor: TimeInterval, _ failure: CaptureFailure) {
         generation += 1
         lifecycle = .idle
         processor?.cancel()
         ringBuffer.reset()
-        lastFailure = reason
-        logger.error("Audio capture stopped unexpectedly: \(reason, privacy: .public)")
+        lastFailure = failure
+        logger.error("Audio capture stopped unexpectedly: \(failure.reason, privacy: .public)")
+        noteRefusal(failure.cause)
         onStateChange?()
-        onUnexpectedStop?(stoppedByUser, ranFor)
+        onUnexpectedStop?(failure.cause, ranFor)
     }
 }
 
 extension AudioEngine: SCStreamDelegate {
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
         let streamID = ObjectIdentifier(stream)
-        let stoppedByUser = (error as? SCStreamError)?.code == .userStopped
-        let reason = error.localizedDescription
+        let failure = CaptureFailure(cause: .classify(error), reason: error.localizedDescription)
         Task { @MainActor [weak self] in
-            self?.handleStreamStopped(streamID, stoppedByUser: stoppedByUser, reason: reason)
+            self?.handleStreamStopped(streamID, failure)
         }
     }
 }
@@ -300,13 +357,16 @@ private final class OneShotInput: @unchecked Sendable {
 /// kCMSampleBufferError_ArrayTooSmall (-12737) for stereo, so no audio ever reached analysis.
 ///
 /// When the delivered format already matches the target (the normal case), channel pointers are
-/// copied straight into the ring buffer with no allocation. Anything else goes through a
-/// persistent `AVAudioConverter` using the pull-callback API — the one-shot
-/// `convert(to:from:)` can't change sample rate.
+/// copied straight into the ring buffer with no allocation. Anything else goes through an
+/// `AVAudioConverter` using the pull-callback API — the one-shot `convert(to:from:)` can't change
+/// sample rate. The format is checked on every buffer, so a stream that changes format midway
+/// (after an output-device change, say) gets a converter built for the new one; one that goes
+/// back to the target format drops its converter, so returning to the old format later starts
+/// from fresh resampler state instead of splicing in the tail of audio from before.
 ///
 /// `@unchecked Sendable`: mutable state is only touched on the serial sample queue (SCStream
-/// delivers to one queue serially); `cancelled` is lock-protected because `cancel()` comes from
-/// the main actor.
+/// delivers to one queue serially); `cancelled` and `sharedHealth` are lock-protected because the
+/// main actor uses them.
 final class AudioSampleProcessor: NSObject, SCStreamOutput, @unchecked Sendable {
     private let logger = Logger(subsystem: "com.openglow.app", category: "AudioCapture")
     private let ringBuffer: AudioRingBuffer
@@ -319,14 +379,23 @@ final class AudioSampleProcessor: NSObject, SCStreamOutput, @unchecked Sendable 
     private var outputBuffer: AVAudioPCMBuffer?
     private var loggedFirstBuffer = false
     private var failureCount = 0
-    private let sharedFailureCount = OSAllocatedUnfairLock(initialState: 0)
+    /// Whether the buffer being ingested has reported a failure.
+    private var bufferFailed = false
+    /// Sample-queue copy of `sharedHealth.droppedInARow`, so a readable buffer only takes the
+    /// lock when it ends a run of failures.
+    private var droppedInARow = 0
+    private let sharedHealth = OSAllocatedUnfairLock(initialState: CaptureHealth())
+    private let onUnreadable: (@Sendable (AudioSampleProcessor) -> Void)?
 
-    /// Buffers delivered but not readable so far. Read from the main actor.
-    var droppedBufferCount: Int { sharedFailureCount.withLock { $0 } }
+    /// How readable the buffers have been so far. Read from the main actor.
+    var health: CaptureHealth { sharedHealth.withLock { $0 } }
 
-    init(ringBuffer: AudioRingBuffer, targetFormat: AVAudioFormat) {
+    /// `onUnreadable` runs on the sample queue, once each time a run of unreadable buffers
+    /// reaches `AudioEngineConfig.unreadableBufferRun`.
+    init(ringBuffer: AudioRingBuffer, targetFormat: AVAudioFormat, onUnreadable: (@Sendable (AudioSampleProcessor) -> Void)? = nil) {
         self.ringBuffer = ringBuffer
         self.targetFormat = targetFormat
+        self.onUnreadable = onUnreadable
     }
 
     /// Stops writing into the ring buffer immediately, even if the stream delivers a few more
@@ -344,7 +413,10 @@ final class AudioSampleProcessor: NSObject, SCStreamOutput, @unchecked Sendable 
     /// so tests can feed synthetic buffers in each layout ScreenCaptureKit might deliver.
     func ingest(_ sampleBuffer: CMSampleBuffer) {
         guard !cancelled.withLock({ $0 }), sampleBuffer.isValid else { return }
-        guard let asbd = sampleBuffer.formatDescription?.audioStreamBasicDescription else {
+        bufferFailed = false
+        defer { if !bufferFailed { bufferWasReadable() } }
+        guard let formatDescription = sampleBuffer.formatDescription,
+              let asbd = formatDescription.audioStreamBasicDescription else {
             reportFailure("audio buffer has no stream description")
             return
         }
@@ -359,9 +431,10 @@ final class AudioSampleProcessor: NSObject, SCStreamOutput, @unchecked Sendable 
         do {
             try sampleBuffer.withAudioBufferList { bufferList, _ in
                 if Self.isDirectlyUsable(asbd) {
+                    if converter != nil { dropConverter() }
                     writeDirect(bufferList, channels: Int(asbd.mChannelsPerFrame), frames: frames)
                 } else {
-                    convertAndWrite(bufferList, asbd: asbd, frames: frames)
+                    convertAndWrite(bufferList, asbd: asbd, formatDescription: formatDescription, frames: frames)
                 }
             }
         } catch {
@@ -387,16 +460,22 @@ final class AudioSampleProcessor: NSObject, SCStreamOutput, @unchecked Sendable 
         }
         // Mono content drives both edges equally.
         let rightBuffer = channels > 1 ? bufferList[1] : bufferList[0]
-        guard let right = rightBuffer.mData?.assumingMemoryBound(to: Float.self) else { return }
+        guard let right = rightBuffer.mData?.assumingMemoryBound(to: Float.self) else {
+            reportFailure("right channel has no data")
+            return
+        }
         let available = Int(min(bufferList[0].mDataByteSize, rightBuffer.mDataByteSize)) / MemoryLayout<Float>.size
         ringBuffer.write(left: left, right: right, count: min(frames, available))
     }
 
-    private func convertAndWrite(_ bufferList: UnsafeMutableAudioBufferListPointer, asbd: AudioStreamBasicDescription, frames: Int) {
+    private func convertAndWrite(
+        _ bufferList: UnsafeMutableAudioBufferListPointer,
+        asbd: AudioStreamBasicDescription,
+        formatDescription: CMFormatDescription,
+        frames: Int
+    ) {
         if converter == nil || !Self.sameFormat(asbd, converterSourceASBD) {
-            var description = asbd
-            guard let sourceFormat = AVAudioFormat(streamDescription: &description),
-                  let newConverter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+            guard let (sourceFormat, newConverter) = makeConverter(asbd, formatDescription: formatDescription) else {
                 reportFailure("unsupported capture format: \(asbd.mSampleRate) Hz, \(asbd.mChannelsPerFrame) ch, flags \(asbd.mFormatFlags)")
                 return
             }
@@ -415,10 +494,13 @@ final class AudioSampleProcessor: NSObject, SCStreamOutput, @unchecked Sendable 
         input.frameLength = AVAudioFrameCount(min(frames, Int(input.frameCapacity)))
 
         let needed = AVAudioFrameCount((Double(input.frameLength) * targetFormat.sampleRate / sourceFormat.sampleRate).rounded(.up)) + 64
-        if outputBuffer == nil || outputBuffer!.frameCapacity < needed {
+        if outputBuffer.map({ $0.frameCapacity < needed }) ?? true {
             outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: needed)
         }
-        guard let output = outputBuffer else { return }
+        guard let output = outputBuffer else {
+            reportFailure("could not allocate the conversion buffer")
+            return
+        }
         output.frameLength = 0
 
         let feeder = OneShotInput(input)
@@ -441,6 +523,40 @@ final class AudioSampleProcessor: NSObject, SCStreamOutput, @unchecked Sendable 
         ringBuffer.write(left: channels[0], right: right, count: Int(output.frameLength))
     }
 
+    /// A converter from `asbd` to the target format. Beyond two channels AVAudioFormat needs a
+    /// channel layout: the stream's own when it has a known one (then downmixed, so center and
+    /// surrounds count), otherwise the first two channels are taken as left and right — without
+    /// that map a discrete layout converts to silence.
+    private func makeConverter(_ asbd: AudioStreamBasicDescription, formatDescription: CMFormatDescription) -> (AVAudioFormat, AVAudioConverter)? {
+        var description = asbd
+        let channels = asbd.mChannelsPerFrame
+        guard channels > 2 else {
+            guard let format = AVAudioFormat(streamDescription: &description),
+                  let converter = AVAudioConverter(from: format, to: targetFormat) else { return nil }
+            return (format, converter)
+        }
+        var layoutSize = 0
+        let streamLayout = CMAudioFormatDescriptionGetChannelLayout(formatDescription, sizeOut: &layoutSize)
+            .flatMap { AVAudioChannelLayout(layout: $0) }
+            .flatMap { $0.channelCount == channels ? $0 : nil }
+        let isDiscrete = streamLayout.map { $0.layoutTag & 0xFFFF_0000 == kAudioChannelLayoutTag_DiscreteInOrder } ?? true
+        guard let layout = (isDiscrete ? nil : streamLayout) ?? AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | channels),
+              let format = AVAudioFormat(streamDescription: &description, channelLayout: layout),
+              let converter = AVAudioConverter(from: format, to: targetFormat) else { return nil }
+        if isDiscrete {
+            converter.channelMap = [0, 1]
+        } else {
+            converter.downmix = true
+        }
+        return (format, converter)
+    }
+
+    private func dropConverter() {
+        converter = nil
+        converterSourceFormat = nil
+        converterSourceASBD = nil
+    }
+
     private static func sameFormat(_ a: AudioStreamBasicDescription, _ b: AudioStreamBasicDescription?) -> Bool {
         guard let b else { return false }
         return a.mSampleRate == b.mSampleRate
@@ -451,11 +567,23 @@ final class AudioSampleProcessor: NSObject, SCStreamOutput, @unchecked Sendable 
             && a.mBitsPerChannel == b.mBitsPerChannel
     }
 
+    private func bufferWasReadable() {
+        guard droppedInARow > 0 else { return }
+        droppedInARow = 0
+        sharedHealth.withLock { $0.droppedInARow = 0 }
+    }
+
     private func reportFailure(_ message: String) {
+        bufferFailed = true
         failureCount += 1
-        sharedFailureCount.withLock { $0 += 1 }
+        droppedInARow += 1
+        sharedHealth.withLock {
+            $0.droppedBuffers += 1
+            $0.droppedInARow += 1
+        }
         if failureCount == 1 || failureCount % AudioEngineConfig.failureLogInterval == 0 {
             logger.error("Dropped audio buffer (\(self.failureCount, privacy: .public) so far): \(message, privacy: .public)")
         }
+        if droppedInARow == AudioEngineConfig.unreadableBufferRun { onUnreadable?(self) }
     }
 }

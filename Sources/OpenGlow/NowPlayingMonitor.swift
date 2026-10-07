@@ -117,7 +117,7 @@ final class NowPlayingMonitor {
         observer = NowPlayingObserver(
             onPlayerInfo: { [weak self] in self?.handle($0) },
             onLaunch: { [weak self] in self?.playerLaunched($0) },
-            onQuit: { [weak self] in self?.playerQuit($0) }
+            onQuit: { [weak self] player, pid in self?.playerQuit(player, pid: pid) }
         )
         for player in Player.allCases {
             records[player] = PlayerRecord(isRunning: Self.isRunning(player), generation: nextGeneration())
@@ -178,9 +178,12 @@ final class NowPlayingMonitor {
         recomputeStatus()
     }
 
-    private func playerQuit(_ player: Player) {
+    /// `pid` is the process that quit, when known. It never counts as running any more, even if
+    /// NSRunningApplication hasn't caught up yet — otherwise the player would read as running but
+    /// not playing until the next poll, instead of gone.
+    private func playerQuit(_ player: Player, pid: pid_t? = nil) {
         guard isStarted else { return }
-        resetRecord(player, isRunning: Self.isRunning(player))
+        resetRecord(player, isRunning: Self.isRunning(player, excluding: pid))
         // A relaunch counts as a new session: its first track gets its artwork delivered again.
         if artworkKey?.player == player { artworkKey = nil }
         logger.info("\(player.displayName, privacy: .public) quit")
@@ -389,8 +392,9 @@ final class NowPlayingMonitor {
         return changeCounter
     }
 
-    private static func isRunning(_ player: Player) -> Bool {
-        NSRunningApplication.runningApplications(withBundleIdentifier: player.bundleIdentifier).contains { !$0.isTerminated }
+    private static func isRunning(_ player: Player, excluding quitPID: pid_t? = nil) -> Bool {
+        NSRunningApplication.runningApplications(withBundleIdentifier: player.bundleIdentifier)
+            .contains { !$0.isTerminated && $0.processIdentifier != quitPID }
     }
 }
 
@@ -592,12 +596,12 @@ extension NowPlayingMonitor {
 private final class NowPlayingObserver: NSObject {
     private let onPlayerInfo: (NowPlayingMonitor.PlayerNotification) -> Void
     private let onLaunch: (NowPlayingMonitor.Player) -> Void
-    private let onQuit: (NowPlayingMonitor.Player) -> Void
+    private let onQuit: (NowPlayingMonitor.Player, pid_t?) -> Void
 
     init(
         onPlayerInfo: @escaping (NowPlayingMonitor.PlayerNotification) -> Void,
         onLaunch: @escaping (NowPlayingMonitor.Player) -> Void,
-        onQuit: @escaping (NowPlayingMonitor.Player) -> Void
+        onQuit: @escaping (NowPlayingMonitor.Player, pid_t?) -> Void
     ) {
         self.onPlayerInfo = onPlayerInfo
         self.onLaunch = onLaunch
@@ -627,17 +631,20 @@ private final class NowPlayingObserver: NSObject {
     }
 
     @objc nonisolated private func applicationLaunched(_ notification: Notification) {
-        guard let player = Self.player(in: notification) else { return }
+        guard let (player, _) = Self.player(in: notification) else { return }
         Task { @MainActor [weak self] in self?.onLaunch(player) }
     }
 
     @objc nonisolated private func applicationTerminated(_ notification: Notification) {
-        guard let player = Self.player(in: notification) else { return }
-        Task { @MainActor [weak self] in self?.onQuit(player) }
+        guard let (player, pid) = Self.player(in: notification) else { return }
+        Task { @MainActor [weak self] in self?.onQuit(player, pid) }
     }
 
-    nonisolated private static func player(in notification: Notification) -> NowPlayingMonitor.Player? {
+    nonisolated private static func player(in notification: Notification) -> (NowPlayingMonitor.Player, pid_t?)? {
         let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-        return NowPlayingMonitor.Player.allCases.first { $0.bundleIdentifier == application?.bundleIdentifier }
+        guard let player = NowPlayingMonitor.Player.allCases.first(where: { $0.bundleIdentifier == application?.bundleIdentifier }) else {
+            return nil
+        }
+        return (player, application?.processIdentifier)
     }
 }

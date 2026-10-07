@@ -17,7 +17,7 @@ extension NSScreen {
 }
 
 /// Owns the set of overlay windows — one per connected, enabled display — and keeps it in sync
-/// with the real display configuration and system sleep state.
+/// with the real display configuration, and hides them all while the glow is suspended.
 ///
 /// `NSApplication.didChangeScreenParametersNotification` fires for display connect/disconnect,
 /// resolution changes, scaling changes, and arrangement changes alike, so a single handler
@@ -26,11 +26,10 @@ extension NSScreen {
 /// flash every window on unrelated changes and would drop per-display state keyed by a UUID that
 /// never actually changed.
 ///
-/// Per-display sleep detection (an external monitor sleeping independently while others stay
-/// awake) still isn't implemented — that needs a lower-level `CGDisplayRegisterReconfigurationCallback`,
-/// which is real added complexity. What's implemented is whole-system sleep/wake (lid close,
-/// display sleep from System Settings or `pmset displaysleepnow`); `AppDelegate` observes the same
-/// notifications separately to pause audio capture and the render loop at the same time.
+/// Sleep, the lock screen and the rest are `ScreenSessionMonitor`'s: `AppDelegate` sets `isSuspended`
+/// from it, so a display that connects or reconfigures while the screen is locked or asleep stays
+/// hidden too. Per-display sleep (an external monitor sleeping while others stay awake) isn't
+/// tracked — that needs `CGDisplayRegisterReconfigurationCallback`, which is real added complexity.
 @MainActor
 final class DisplayManager {
     private var controllers: [String: OverlayWindowController] = [:]
@@ -39,11 +38,21 @@ final class DisplayManager {
     private(set) var palette: GlowPalette = .fallback
 
     /// Called after the set of displays changes (connect, disconnect, reconfiguration).
+    private var timerFraction: Double?
+
     var onDisplaysChanged: (() -> Void)?
 
-    /// Whether any overlay is meant to be on screen — capture has no reason to run otherwise.
+    /// Whether any overlay is meant to be on screen, by the settings — capture has no reason to
+    /// run otherwise. Doesn't consider `isSuspended`.
     var hasVisibleOverlay: Bool {
         settings.isEnabled && controllers.keys.contains { settings.isDisplayEnabled(uuid: $0) }
+    }
+
+    /// While true every overlay stays hidden — the screens are asleep or locked, the screen saver
+    /// runs, or another user has the console. Clearing it shows them again as they were, with no
+    /// opening sweep.
+    var isSuspended = false {
+        didSet { if isSuspended != oldValue { applyVisibility() } }
     }
 
     init() {
@@ -53,24 +62,11 @@ final class DisplayManager {
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self,
-            selector: #selector(screensDidSleep),
-            name: NSWorkspace.screensDidSleepNotification,
-            object: nil
-        )
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self,
-            selector: #selector(screensDidWake),
-            name: NSWorkspace.screensDidWakeNotification,
-            object: nil
-        )
         rebuild()
     }
 
     deinit {
         NotificationCenter.default.removeObserver(self)
-        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     /// Current displays, for the per-display toggles in the menu and popover.
@@ -83,9 +79,18 @@ final class DisplayManager {
 
     func applyVisibility() {
         for (uuid, controller) in controllers {
-            let shouldShow = settings.isEnabled && settings.isDisplayEnabled(uuid: uuid)
-            shouldShow ? controller.show() : controller.hide()
+            shouldShow(uuid) ? controller.show() : controller.hide()
         }
+    }
+
+    private func shouldShow(_ uuid: String) -> Bool {
+        !isSuspended && settings.isEnabled && settings.isDisplayEnabled(uuid: uuid)
+    }
+
+    /// Whether `displayID` is still connected. Online rather than in `NSScreen.screens`: a display
+    /// that joins a mirror set leaves that list but stays connected, and capture tied to it works.
+    nonisolated static func isOnline(_ displayID: CGDirectDisplayID) -> Bool {
+        CGDisplayIsOnline(displayID) != 0
     }
 
     /// Re-applies the current notch-handling preference to every open overlay window immediately,
@@ -105,8 +110,29 @@ final class DisplayManager {
 
     /// The opening sweep on every visible display — at launch and when Open Glow is turned on.
     func playIntro() {
-        for (uuid, controller) in controllers where settings.isEnabled && settings.isDisplayEnabled(uuid: uuid) {
+        for (uuid, controller) in controllers where shouldShow(uuid) {
             controller.playIntro()
+        }
+    }
+
+    /// A short sweep in `palette`'s colors on every visible display (a coding session starting).
+    func playAccent(_ palette: GlowPalette) {
+        for (uuid, controller) in controllers where shouldShow(uuid) {
+            controller.playAccent(palette)
+        }
+    }
+
+    /// A running timer's remaining share (1 → 0) as a ring of light on every display, and on
+    /// displays connected later; nil when no timer runs.
+    func setTimerRing(remaining fraction: Double?) {
+        timerFraction = fraction
+        controllers.values.forEach { $0.setTimerRing(remaining: fraction) }
+    }
+
+    /// The finish pulses at the end of a timer or Pomodoro phase, on every visible display.
+    func playTimerFinished() {
+        for (uuid, controller) in controllers where shouldShow(uuid) {
+            controller.playTimerFinished()
         }
     }
 
@@ -153,14 +179,6 @@ final class DisplayManager {
         rebuild()
     }
 
-    @objc private func screensDidSleep() {
-        controllers.values.forEach { $0.hide() }
-    }
-
-    @objc private func screensDidWake() {
-        applyVisibility()
-    }
-
     private func rebuild() {
         let liveScreens = NSScreen.screens
         var liveUUIDs = Set<String>()
@@ -171,20 +189,19 @@ final class DisplayManager {
             if let existing = controllers[uuid] {
                 existing.updateScreen(screen)
             } else {
+                // A display that connects mid-sweep joins without one — the sweep belongs to launch
+                // and turning on — but with everything else the others have, music included.
                 let controller = OverlayWindowController(screen: screen, displayUUID: uuid)
                 applyBaseAppearance(to: controller)
                 controller.setPalette(palette, animated: false)
+                controller.setTimerRing(remaining: timerFraction)
                 if let frameSource { controller.startAudioFrames(source: frameSource) }
                 controllers[uuid] = controller
             }
         }
 
         for uuid in controllers.keys where !liveUUIDs.contains(uuid) {
-            // Stop the link first: it retains the view and would otherwise keep firing for a
-            // display that no longer exists.
-            controllers[uuid]?.stopAudioFrames()
-            controllers[uuid]?.hide()
-            controllers.removeValue(forKey: uuid)
+            controllers.removeValue(forKey: uuid)?.tearDown()
         }
 
         applyVisibility()
