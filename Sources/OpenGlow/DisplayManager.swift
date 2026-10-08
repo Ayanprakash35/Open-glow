@@ -35,7 +35,14 @@ final class DisplayManager {
     private var controllers: [String: OverlayWindowController] = [:]
     private var frameSource: (() -> AudioAnalysisState)?
     private let settings = Settings.shared
+    /// The palette the colors setting asks for (album art, gradient or preset).
     private(set) var palette: GlowPalette = .fallback
+    /// While set, every display shows this instead of `palette`: a coding session is running and
+    /// the glow keeps that tool's colors for as long as it runs.
+    private(set) var sessionPalette: GlowPalette?
+
+    /// What the displays actually show.
+    private var shownPalette: GlowPalette { sessionPalette ?? palette }
 
     /// Called after the set of displays changes (connect, disconnect, reconfiguration).
     private var timerFraction: Double?
@@ -139,10 +146,19 @@ final class DisplayManager {
         }
     }
 
-    /// Shows `newPalette` on every display, and on displays connected later.
+    /// Shows `newPalette` on every display, and on displays connected later — unless a session
+    /// palette is showing, in which case it's kept for when that ends.
     func setPalette(_ newPalette: GlowPalette, animated: Bool) {
         palette = newPalette
-        controllers.values.forEach { $0.setPalette(newPalette, animated: animated) }
+        controllers.values.forEach { $0.setPalette(shownPalette, animated: animated) }
+    }
+
+    /// Shows `newPalette` in place of the chosen colors until it's set back to nil, which returns
+    /// to them. Unanimated is for swapping underneath an accent that already covers the edge.
+    func setSessionPalette(_ newPalette: GlowPalette?, animated: Bool) {
+        guard newPalette != sessionPalette else { return }
+        sessionPalette = newPalette
+        controllers.values.forEach { $0.setPalette(shownPalette, animated: animated) }
     }
 
     /// Music Sync on: every overlay (including displays connected later) animates from `source`.
@@ -196,7 +212,7 @@ final class DisplayManager {
                 // and turning on — but with everything else the others have, music included.
                 let controller = OverlayWindowController(screen: screen, displayUUID: uuid)
                 applyBaseAppearance(to: controller)
-                controller.setPalette(palette, animated: false)
+                controller.setPalette(shownPalette, animated: false)
                 controller.setTimerRing(remaining: timerFraction, rate: timerRate)
                 if let frameSource { controller.startAudioFrames(source: frameSource) }
                 controllers[uuid] = controller
