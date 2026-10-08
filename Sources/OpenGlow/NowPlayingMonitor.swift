@@ -25,7 +25,14 @@ enum NowPlayingConfig {
 /// the state and track), NSWorkspace says when a player launches or quits. Apple Events — via
 /// `NowPlayingScriptRunner`, never on the main thread — fill in what notifications don't have:
 /// the state at `start()`, Music's artwork and Spotify's artwork URL. A slow safety poll runs only
-/// while a supported player does. The private MediaRemote framework is not used.
+/// while a followed player does. The private MediaRemote framework is not used.
+///
+/// Only the players in `players` are watched. Any other is left alone entirely: its
+/// notifications aren't listened to, it's never sent an Apple Event or polled, its artwork is
+/// never fetched, and it counts as not running.
+///
+/// Artwork: Music hands its over by Apple Event; Spotify's is downloaded over https from the
+/// address Spotify reports, which is on Spotify's image CDN.
 ///
 /// The Automation prompt should appear when it makes sense to the user, not at app launch: only
 /// a query that follows playback starting in a player, or `refresh()`, may show it. Every other
@@ -51,6 +58,14 @@ final class NowPlayingMonitor {
             case .spotify: "Spotify"
             }
         }
+
+        /// The distributed notification the player posts whenever playback or the track changes.
+        var notificationName: String {
+            switch self {
+            case .music: "com.apple.Music.playerInfo"
+            case .spotify: "com.spotify.client.PlaybackStateChanged"
+            }
+        }
     }
 
     struct Track: Equatable, Sendable {
@@ -61,6 +76,10 @@ final class NowPlayingMonitor {
         var title: String
         var artist: String
         var album: String
+        /// Whether the track is a file on this Mac: true or false when Music's notification said
+        /// (it names a file location for local files only), nil when nothing said — a track
+        /// read by a script, or any Spotify track.
+        var isLocalFile: Bool? = nil
     }
 
     enum Status: Equatable, Sendable {
@@ -78,14 +97,25 @@ final class NowPlayingMonitor {
     private(set) var status: Status = .stopped
     /// Main actor, whenever `status` changes.
     var onStatusChange: ((Status) -> Void)?
-    /// Main actor, once per newly playing track: its artwork image data, or nil when the track
-    /// has none or it couldn't be fetched. Not repeated for the same track — pausing and resuming
-    /// doesn't repeat it, so keep the last artwork alongside its track — but repeated when the
-    /// monitor restarts or the player relaunches.
+    /// Main actor, once per newly playing track while it's still the one playing: its artwork
+    /// image data, or nil when the track has none or it couldn't be fetched. Not repeated for the
+    /// same track — pausing and resuming doesn't repeat it, so keep the last artwork alongside its
+    /// track — but repeated when the monitor restarts, the player relaunches, or the player is
+    /// followed again after a break.
     var onArtwork: ((Track, Data?) -> Void)?
 
+    /// The players followed (see the type's comment). Changing it while started forgets
+    /// everything a dropped player said, and asks a newly followed one what it plays — silently,
+    /// so the Automation prompt doesn't appear.
+    var players: Set<Player> = Set(Player.allCases) {
+        didSet { if players != oldValue { playersChanged(from: oldValue) } }
+    }
+
     private let logger = Logger(subsystem: "com.openglow.app", category: "NowPlaying")
-    private let scripts = NowPlayingScriptRunner()
+    private let scripts: any NowPlayingQuerying
+    /// Whether a player's app runs, leaving out the process that just quit if one is given.
+    private let checkRunning: @MainActor (Player, _ excluding: pid_t?) -> Bool
+    private let observesPlayers: Bool
     private var observer: NowPlayingObserver?
     private var pollTimer: Timer?
     private var isStarted = false
@@ -111,18 +141,33 @@ final class NowPlayingMonitor {
         return URLSession(configuration: configuration)
     }()
 
+    /// The defaults talk to the real players. Tests pass stand-ins for the scripts and the
+    /// running check, and `observesPlayers: false` so real players' notifications stay out.
+    init(
+        scripts: any NowPlayingQuerying = NowPlayingScriptRunner(),
+        checkRunning: @escaping @MainActor (Player, _ excluding: pid_t?) -> Bool = { NowPlayingMonitor.isRunning($0, excluding: $1) },
+        observesPlayers: Bool = true
+    ) {
+        self.scripts = scripts
+        self.checkRunning = checkRunning
+        self.observesPlayers = observesPlayers
+    }
+
     func start() {
         guard !isStarted else { return }
         isStarted = true
-        observer = NowPlayingObserver(
-            onPlayerInfo: { [weak self] in self?.handle($0) },
-            onLaunch: { [weak self] in self?.playerLaunched($0) },
-            onQuit: { [weak self] player, pid in self?.playerQuit(player, pid: pid) }
-        )
-        for player in Player.allCases {
-            records[player] = PlayerRecord(isRunning: Self.isRunning(player), generation: nextGeneration())
+        if observesPlayers {
+            observer = NowPlayingObserver(
+                players: players,
+                onPlayerInfo: { [weak self] in self?.handle($0) },
+                onLaunch: { [weak self] in self?.playerLaunched($0) },
+                onQuit: { [weak self] player, pid in self?.playerQuit(player, pid: pid) }
+            )
         }
-        logger.notice("Now-playing monitor started")
+        for player in Player.allCases {
+            records[player] = PlayerRecord(isRunning: runs(player), generation: nextGeneration())
+        }
+        logger.notice("Now-playing monitor started for \(self.followedNames, privacy: .public)")
         recomputeStatus()
         for player in Player.allCases where records[player]?.isRunning == true {
             requestQuery(player, .silent)
@@ -155,13 +200,34 @@ final class NowPlayingMonitor {
         }
     }
 
+    /// A player was followed or dropped. A dropped one's record starts over as not running, so
+    /// its queries in flight are dropped and it no longer counts; following it again later is a
+    /// new session, whose track's artwork is delivered again.
+    private func playersChanged(from old: Set<Player>) {
+        guard isStarted else { return }
+        observer?.listen(to: players)
+        let changed = Player.allCases.filter { players.contains($0) != old.contains($0) }
+        for player in changed {
+            resetRecord(player, isRunning: runs(player))
+            if artworkKey?.player == player { artworkKey = nil }
+        }
+        logger.notice("Now-playing monitor follows \(self.followedNames, privacy: .public)")
+        recomputeStatus()
+        // Silent: turning a player on in settings isn't playback starting, so no prompt. Once
+        // access is granted this colors the glow from the track already playing.
+        for player in changed where records[player]?.isRunning == true {
+            requestQuery(player, .silent)
+        }
+    }
+
     // MARK: - Events
 
-    private func handle(_ notification: PlayerNotification) {
-        guard isStarted else { return }
+    /// Internal so tests can feed notifications in.
+    func handle(_ notification: PlayerNotification) {
+        guard isStarted, players.contains(notification.player) else { return }
         let player = notification.player
         var record = records[player] ?? PlayerRecord(generation: nextGeneration())
-        record.isRunning = Self.isRunning(player)
+        record.isRunning = runs(player)
         let query = record.apply(notification, change: nextChange())
         records[player] = record
         logger.debug("\(player.displayName, privacy: .public) notification: \(notification.state.map { "\($0)" } ?? "no state", privacy: .public)")
@@ -171,7 +237,7 @@ final class NowPlayingMonitor {
 
     private func playerLaunched(_ player: Player) {
         // Already known to run when its first notification beat NSWorkspace's: keep what it said.
-        guard isStarted, records[player]?.isRunning != true else { return }
+        guard isStarted, players.contains(player), records[player]?.isRunning != true else { return }
         resetRecord(player, isRunning: true)
         logger.info("\(player.displayName, privacy: .public) launched")
         // Nothing is sent yet: a player that starts playing says so, and the poll covers the rest.
@@ -182,8 +248,8 @@ final class NowPlayingMonitor {
     /// NSRunningApplication hasn't caught up yet — otherwise the player would read as running but
     /// not playing until the next poll, instead of gone.
     private func playerQuit(_ player: Player, pid: pid_t? = nil) {
-        guard isStarted else { return }
-        resetRecord(player, isRunning: Self.isRunning(player, excluding: pid))
+        guard isStarted, players.contains(player) else { return }
+        resetRecord(player, isRunning: runs(player, excluding: pid))
         // A relaunch counts as a new session: its first track gets its artwork delivered again.
         if artworkKey?.player == player { artworkKey = nil }
         logger.info("\(player.displayName, privacy: .public) quit")
@@ -199,8 +265,8 @@ final class NowPlayingMonitor {
 
     /// Catches a launch or quit whose notification was missed.
     private func syncRunningPlayers() {
-        for player in Player.allCases {
-            let running = Self.isRunning(player)
+        for player in Player.allCases where players.contains(player) {
+            let running = runs(player)
             guard running != records[player]?.isRunning else { continue }
             if running { playerLaunched(player) } else { playerQuit(player) }
         }
@@ -233,7 +299,7 @@ final class NowPlayingMonitor {
 
     /// At most one query per player is in flight; asking again meanwhile queues one more.
     private func requestQuery(_ player: Player, _ policy: PromptPolicy) {
-        guard isStarted, let record = records[player], record.isRunning else { return }
+        guard isStarted, players.contains(player), let record = records[player], record.isRunning else { return }
         guard !queriesInFlight.contains(player) else {
             requeries[player] = requeries[player] == .mayPrompt ? .mayPrompt : policy
             return
@@ -263,7 +329,7 @@ final class NowPlayingMonitor {
             record.apply(snapshot, change: nextChange())
         case .notRunning:
             // It just quit; NSWorkspace's notification follows.
-            record.isRunning = Self.isRunning(player)
+            record.isRunning = runs(player)
             record.state = nil
             record.track = nil
         case .notAuthorized:
@@ -307,7 +373,7 @@ final class NowPlayingMonitor {
     // MARK: - Artwork
 
     private func updateArtwork() {
-        guard case .playing(let track) = status else { return }
+        guard case .playing(let track) = status, players.contains(track.player) else { return }
         let key = ArtworkKey(player: track.player, id: track.id)
         guard key != artworkKey else { return }
         if track.id.isEmpty {
@@ -351,6 +417,13 @@ final class NowPlayingMonitor {
         logger.debug("Artwork for \(track.player.displayName, privacy: .public) track: \(fetch.data?.count ?? 0, privacy: .public) bytes")
         // Dropped if a newer track took over or the monitor stopped meanwhile.
         guard isStarted, artworkKey == key else { return }
+        // Also dropped if the track stopped playing — paused, or a new one started that no query
+        // has confirmed yet — so the listener never hears about a track that's no longer current.
+        // Clearing the key lets the track's artwork come again (from the cache) if it resumes.
+        guard case .playing(let current) = status, current.player == track.player, current.id == track.id else {
+            artworkKey = nil
+            return
+        }
         onArtwork?(track, fetch.data)
     }
 
@@ -392,7 +465,17 @@ final class NowPlayingMonitor {
         return changeCounter
     }
 
-    private static func isRunning(_ player: Player, excluding quitPID: pid_t? = nil) -> Bool {
+    /// Whether `player` is followed and runs; an unfollowed player never counts as running.
+    private func runs(_ player: Player, excluding quitPID: pid_t? = nil) -> Bool {
+        players.contains(player) && checkRunning(player, quitPID)
+    }
+
+    private var followedNames: String {
+        let names = Player.allCases.filter(players.contains).map(\.displayName)
+        return names.isEmpty ? "no player" : names.joined(separator: " and ")
+    }
+
+    private static func isRunning(_ player: Player, excluding quitPID: pid_t?) -> Bool {
         NSRunningApplication.runningApplications(withBundleIdentifier: player.bundleIdentifier)
             .contains { !$0.isTerminated && $0.processIdentifier != quitPID }
     }
@@ -455,10 +538,16 @@ extension NowPlayingMonitor {
         }
 
         mutating func apply(_ snapshot: PlayerSnapshot, change: Int) {
-            if snapshot.state != state || snapshot.track != track { lastChange = change }
+            var newTrack = snapshot.track
+            // A script can't tell a local file from a stream; keep what a notification said about
+            // this same track, so confirming it isn't mistaken for a change.
+            if newTrack?.isLocalFile == nil, let track, track.id == newTrack?.id {
+                newTrack?.isLocalFile = track.isLocalFile
+            }
+            if snapshot.state != state || newTrack != track { lastChange = change }
             isBlocked = false
             state = snapshot.state
-            track = snapshot.track
+            track = newTrack
             confirmedTrackID = snapshot.track?.id
             artworkURL = snapshot.artworkURL
         }
@@ -467,17 +556,10 @@ extension NowPlayingMonitor {
     /// Parses "com.apple.Music.playerInfo" and "com.spotify.client.PlaybackStateChanged"; nil
     /// for any other notification.
     nonisolated static func parseNotification(name: String, userInfo: [AnyHashable: Any]) -> PlayerNotification? {
-        let player: Player
-        let id: String?
-        switch name {
-        case "com.apple.Music.playerInfo":
-            player = .music
-            id = musicID(fromNotificationValue: userInfo["PersistentID"])
-        case "com.spotify.client.PlaybackStateChanged":
-            player = .spotify
-            id = userInfo["Track ID"] as? String
-        default:
-            return nil
+        guard let player = Player.allCases.first(where: { $0.notificationName == name }) else { return nil }
+        let id: String? = switch player {
+        case .music: musicID(fromNotificationValue: userInfo["PersistentID"])
+        case .spotify: userInfo["Track ID"] as? String
         }
         let state: PlaybackState? = switch (userInfo["Player State"] as? String)?.lowercased() {
         case "playing": .playing
@@ -492,10 +574,22 @@ extension NowPlayingMonitor {
                 id: id,
                 title: userInfo["Name"] as? String ?? "",
                 artist: userInfo["Artist"] as? String ?? "",
-                album: userInfo["Album"] as? String ?? ""
+                album: userInfo["Album"] as? String ?? "",
+                isLocalFile: player == .music ? isFileLocation(userInfo["Location"]) : nil
             )
         }
         return PlayerNotification(player: player, state: state, track: track)
+    }
+
+    /// Whether Music's "Location" value names a file on this Mac. Music sends it, as a file URL,
+    /// only for tracks stored as files; streamed Apple Music tracks and radio come without one,
+    /// so a missing or unreadable value means "not a local file".
+    nonisolated static func isFileLocation(_ value: Any?) -> Bool {
+        switch value {
+        case let url as URL: url.isFileURL
+        case let text as String: text.hasPrefix("/") || URL(string: text)?.isFileURL == true
+        default: false
+        }
     }
 
     /// Music's notification carries the persistent ID as a signed 64-bit number; AppleScript gives
@@ -599,6 +693,7 @@ private final class NowPlayingObserver: NSObject {
     private let onQuit: (NowPlayingMonitor.Player, pid_t?) -> Void
 
     init(
+        players: Set<NowPlayingMonitor.Player>,
         onPlayerInfo: @escaping (NowPlayingMonitor.PlayerNotification) -> Void,
         onLaunch: @escaping (NowPlayingMonitor.Player) -> Void,
         onQuit: @escaping (NowPlayingMonitor.Player, pid_t?) -> Void
@@ -607,16 +702,22 @@ private final class NowPlayingObserver: NSObject {
         self.onLaunch = onLaunch
         self.onQuit = onQuit
         super.init()
-        let distributed = DistributedNotificationCenter.default()
-        for name in ["com.apple.Music.playerInfo", "com.spotify.client.PlaybackStateChanged"] {
-            distributed.addObserver(
-                self, selector: #selector(playerInfoChanged(_:)), name: Notification.Name(name),
-                object: nil, suspensionBehavior: .deliverImmediately
-            )
-        }
+        listen(to: players)
         let workspace = NSWorkspace.shared.notificationCenter
         workspace.addObserver(self, selector: #selector(applicationLaunched(_:)), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
         workspace.addObserver(self, selector: #selector(applicationTerminated(_:)), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
+    }
+
+    /// Hears the notifications of `players` only: a player that isn't followed isn't listened to.
+    func listen(to players: Set<NowPlayingMonitor.Player>) {
+        let distributed = DistributedNotificationCenter.default()
+        distributed.removeObserver(self)
+        for player in NowPlayingMonitor.Player.allCases where players.contains(player) {
+            distributed.addObserver(
+                self, selector: #selector(playerInfoChanged(_:)), name: Notification.Name(player.notificationName),
+                object: nil, suspensionBehavior: .deliverImmediately
+            )
+        }
     }
 
     func invalidate() {

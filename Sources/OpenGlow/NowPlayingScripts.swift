@@ -249,13 +249,23 @@ enum NowPlayingScript: Hashable, Sendable {
     }
 }
 
+/// The Apple Events `NowPlayingMonitor` sends: `NowPlayingScriptRunner` in the app, a stand-in
+/// in tests.
+protocol NowPlayingQuerying: Sendable {
+    /// What `player` is playing. With `mayPrompt` false, nothing is sent unless the user has
+    /// already granted Automation access.
+    func state(of player: NowPlayingMonitor.Player, mayPrompt: Bool) async -> NowPlayingMonitor.QueryResult
+    /// The current Music track's artwork, if that track is still `trackID`. Never prompts.
+    func musicArtwork(expecting trackID: String) async -> NowPlayingMonitor.ArtworkFetch
+}
+
 /// Runs the scripts on one serial background queue, so a slow or hung player can delay other
 /// queries but never the main thread — the UI and the glow.
 ///
 /// `@unchecked Sendable`: the NSAppleScript objects (neither thread-safe nor Sendable) are
 /// compiled, run and kept only on `queue`, and descriptors are parsed there too; only Sendable
 /// values cross back. Everything else here is immutable.
-final class NowPlayingScriptRunner: @unchecked Sendable {
+final class NowPlayingScriptRunner: NowPlayingQuerying, @unchecked Sendable {
     typealias Player = NowPlayingMonitor.Player
 
     private let logger = Logger(subsystem: "com.openglow.app", category: "NowPlaying")
