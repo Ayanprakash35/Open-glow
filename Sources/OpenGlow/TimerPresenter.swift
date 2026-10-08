@@ -45,7 +45,9 @@ final class TimerPresenter {
 
     private func show(_ snapshot: TimerSnapshot?) {
         panelModel.snapshot = snapshot
-        displayManager.setTimerRing(remaining: snapshot?.remainingFraction)
+        // The pace lets the ring recede smoothly between these once-a-second updates.
+        let rate = snapshot.map { $0.isPaused || $0.duration <= 0 ? 0 : 1 / $0.duration } ?? 0
+        displayManager.setTimerRing(remaining: snapshot?.remainingFraction, rate: rate)
         if let snapshot {
             TimerMenu.showCountdown(snapshot, attention: attention, in: statusItem)
             // The countdown stays readable even while the glow itself is turned off.
