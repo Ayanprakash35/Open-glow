@@ -188,10 +188,21 @@ counting while the Mac sleeps.
 
 ### Coding sessions
 
-Tick **Glow when a coding session starts** and Open Glow plays a short sweep in Claude's colors
-when a Claude Code session starts, or Codex's colors for Codex — from the terminal or the Claude
-app. It notices sessions by watching for their processes (a quick look at the process list every
-1.5 s, about 0.04 ms each time); nothing is sent anywhere.
+**Glow when a coding session starts** (on by default, in the popover's Motion section and the
+right-click menu's **Coding Sessions**) plays a short sweep in Claude's warm orange when a new
+Claude Code session starts, or Codex's indigo for Codex. The **Claude Code** and **Codex**
+checkboxes under it choose which tools get the glow; **Preview** items in the right-click menu
+play each one on demand.
+
+Open Glow notices a session by its process starting: a quick look at the process list every
+1.5 s (about 0.04 ms), reading only the arguments of `claude`, `codex` and Node processes, locally.
+Claude Code from the native installer, Homebrew, npm (including its `claude.exe` layout) and the
+Claude desktop app is recognized; housekeeping commands like `claude mcp` and `--version` aren't.
+Nothing is sent anywhere.
+
+*Known limitation:* the sweep marks a session *starting*. In the Claude desktop app a session
+stays open, so sending another prompt to it doesn't play the glow again. A glow that follows when
+Claude Code or Codex is actually working is in progress.
 
 ## Troubleshooting
 
