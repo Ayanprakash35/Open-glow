@@ -556,6 +556,74 @@ struct CodingSessionMonitorTests {
     }
 }
 
+// MARK: - Glow
+
+/// Which tools' sessions glow, as chosen in Settings.
+@Suite("Coding sessions: glow")
+@MainActor
+struct CodingSessionGlowTests {
+    private func makeSettings(_ name: String) throws -> OpenGlow.Settings {
+        let suite = "OpenGlowCodingSessionGlowTests.\(name)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        return OpenGlow.Settings(defaults: defaults)
+    }
+
+    /// The choice is read as each session starts, not when watching began.
+    @Test func playsOnlyForChosenTools() async throws {
+        let settings = try makeSettings("chosen")
+        settings.setCodingSessionGlow(false, for: .codex)
+        let table = desktop()
+        let monitor = CodingSessionMonitor(table: table, interval: 0.02, tolerance: 0, cooldown: 0)
+        var played: [GlowPalette] = []
+        let glow = CodingSessionGlow(monitor: monitor, settings: settings) { played.append($0) }
+        glow.update(enabled: true)
+        #expect(monitor.isStarted)
+        try await waitUntil { table.scanCount >= 2 }
+
+        table.launch(300, brewCodex, ["codex"], parent: 102)
+        table.launch(301, nativeClaude, ["claude"], parent: 102)
+        try await waitUntil { !played.isEmpty }
+        let scans = table.scanCount
+        try await waitUntil { table.scanCount >= scans + 2 }
+        #expect(played == [Tool.claudeCode.palette])
+
+        settings.setCodingSessionGlow(true, for: .codex)
+        table.launch(302, brewCodex, ["codex"], parent: 102)
+        try await waitUntil { played.count >= 2 }
+        #expect(played == [Tool.claudeCode.palette, Tool.codex.palette])
+
+        settings.codingSessionGlow = false
+        table.launch(303, nativeClaude, ["claude"], parent: 102)
+        let scansNow = table.scanCount
+        try await waitUntil { table.scanCount >= scansNow + 3 }
+        #expect(played.count == 2)
+        glow.update(enabled: false)
+        #expect(!monitor.isStarted)
+    }
+
+    /// With no tool chosen nothing could glow, so the process table isn't watched either.
+    @Test func watchesOnlyWhileAToolIsChosen() throws {
+        let settings = try makeSettings("watching")
+        let monitor = CodingSessionMonitor(table: FakeProcessTable(), interval: 60, tolerance: 0, cooldown: 0)
+        let glow = CodingSessionGlow(monitor: monitor, settings: settings) { _ in }
+        defer { monitor.stop() }
+
+        settings.codingSessionTools = []
+        glow.update(enabled: true)
+        #expect(!monitor.isStarted)
+        settings.setCodingSessionGlow(true, for: .codex)
+        glow.update(enabled: true)
+        #expect(monitor.isStarted)
+        glow.update(enabled: false)
+        #expect(!monitor.isStarted)
+        // The option itself off.
+        settings.codingSessionGlow = false
+        glow.update(enabled: true)
+        #expect(!monitor.isStarted)
+    }
+}
+
 // MARK: - Palettes
 
 @Suite("Coding sessions: palettes")
