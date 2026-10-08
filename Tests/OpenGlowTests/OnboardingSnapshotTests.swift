@@ -194,6 +194,9 @@ private struct OnboardingVariant {
             },
             OnboardingVariant(name: "5-coding", page: .codingSessions),
             OnboardingVariant(name: "5-coding-off", page: .codingSessions) { settings, _ in settings.codingSessionGlow = false },
+            OnboardingVariant(name: "5-coding-codex-off", page: .codingSessions) { settings, _ in
+                settings.setCodingSessionGlow(false, for: .codex)
+            },
             OnboardingVariant(name: "6-all-set", page: .allSet),
             OnboardingVariant(name: "6-all-set-approval", page: .allSet) { _, status in
                 status.launchAtLogin = .requiresApproval

@@ -254,10 +254,13 @@ extension OnboardingPageView {
             OnboardingCard {
                 VStack(alignment: .leading, spacing: 10) {
                     SwitchRow("Glow when a Claude Code or Codex session starts", isOn: $settings.codingSessionGlow)
-                    HStack(spacing: 16) {
-                        legend("Claude Code", palette: OnboardingPalettes.claude)
-                        legend("Codex", palette: OnboardingPalettes.codex)
+                    HStack(spacing: 24) {
+                        ForEach(CodingSessionMonitor.Tool.allCases, id: \.self) { tool in
+                            toolSwitch(tool)
+                        }
+                        Spacer(minLength: 0)
                     }
+                    .disabled(!settings.codingSessionGlow)
                     Text("Open Glow only notices that a session started. It never sees your code or your conversations.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -266,15 +269,24 @@ extension OnboardingPageView {
             }
         }
 
-        private func legend(_ name: String, palette: GlowPalette) -> some View {
-            HStack(spacing: 6) {
-                PaletteSwatch(palette: palette)
-                    .frame(width: 28, height: 10)
-                Text(name)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+        /// The tool's colors as a legend, with a small switch for whether its sessions glow.
+        private func toolSwitch(_ tool: CodingSessionMonitor.Tool) -> some View {
+            Toggle(isOn: Binding(
+                get: { settings.codingSessionTools.contains(tool) },
+                set: { settings.setCodingSessionGlow($0, for: tool) }
+            )) {
+                HStack(spacing: 6) {
+                    PaletteSwatch(palette: OnboardingPalettes.codingSession(tool, in: settings))
+                        .frame(width: 28, height: 10)
+                    Text(tool.displayName)
+                        .font(.callout)
+                        // A disabled toggle dims its switch but not a custom label.
+                        .foregroundStyle(settings.codingSessionGlow ? .primary : .secondary)
+                }
             }
-            .accessibilityElement(children: .combine)
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .help("Glow when a \(tool.displayName) session starts")
         }
     }
 

@@ -119,10 +119,10 @@ final class CodingSessionMonitor {
         logger.notice("Coding session monitor stopped")
     }
 
+    /// Not logged here: `onSessionStarted`'s owner logs each start along with what it did.
     private func report(_ tools: [Tool], generation: Int) {
         guard generation == self.generation else { return }
         for tool in tools {
-            logger.info("\(tool.displayName, privacy: .public) session started")
             onSessionStarted?(tool)
         }
     }

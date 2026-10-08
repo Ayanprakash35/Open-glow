@@ -17,9 +17,12 @@ enum CodingSessionTrackerConfig {
 /// The first scan is the baseline: sessions already running then are never reported. After that,
 /// a process is classified when its PID first appears and once more on the next scan, in case it
 /// was caught just before exec'ing into a session (a wrapper script, `env node`); PIDs seen twice
-/// aren't looked at again. A new session isn't reported when a session of the same tool is one of
-/// its ancestors (npm's codex.js and the binary it runs, a session's own sub-sessions), nor
-/// within the cooldown of the tool's last report.
+/// aren't looked at again. A script runtime first seen running a script that isn't a session gets
+/// no second look: npm's JavaScript build of Claude Code renames itself to a bare "claude" for
+/// housekeeping commands too, so a second look could only mistake `claude mcp serve`, first seen
+/// before it renamed itself, for a session. A new session isn't reported when a session of the
+/// same tool is one of its ancestors (npm's codex.js and the binary it runs, a session's own
+/// sub-sessions), nor within the cooldown of the tool's last report.
 ///
 /// Not thread-safe; owned by one polling task.
 struct CodingSessionTracker {
@@ -61,13 +64,14 @@ struct CodingSessionTracker {
             case .other(settled: true)?:
                 next[pid] = .other(settled: true)
             case let previous:
-                if let tool = Self.classify(pid, in: table) {
+                let look = Self.look(at: pid, in: table)
+                if let tool = look.tool {
                     next[pid] = .session(tool)
                     started.append((pid, tool))
                 } else {
                     // Baseline processes are settled right away: re-reading hundreds of paths
                     // would only catch an exec racing start().
-                    next[pid] = .other(settled: previous != nil || !hasBaseline)
+                    next[pid] = .other(settled: previous != nil || !hasBaseline || look.isFinal)
                 }
             }
         }
@@ -89,10 +93,19 @@ struct CodingSessionTracker {
 
     /// The tool whose session `pid` is; reads its arguments only for likely executables.
     static func classify(_ pid: pid_t, in table: some ProcessTable) -> Tool? {
+        look(at: pid, in: table).tool
+    }
+
+    /// The tool whose session `pid` is, and whether a non-session's answer is final: a script
+    /// runtime whose argv names its script can't become a session without exec'ing, only rename
+    /// itself.
+    private static func look(at pid: pid_t, in table: some ProcessTable) -> (tool: Tool?, isFinal: Bool) {
         guard let path = table.executablePath(of: pid),
               CodingSessionMatcher.isCandidate(executablePath: path)
-        else { return nil }
-        return CodingSessionMatcher.tool(executablePath: path, arguments: table.arguments(of: pid) ?? [])
+        else { return (nil, false) }
+        let arguments = table.arguments(of: pid) ?? []
+        let tool = CodingSessionMatcher.tool(executablePath: path, arguments: arguments)
+        return (tool, tool == nil && CodingSessionMatcher.runsNamedScript(executablePath: path, arguments: arguments))
     }
 
     private func hasAncestorSession(of pid: pid_t, tool: Tool, in table: some ProcessTable) -> Bool {

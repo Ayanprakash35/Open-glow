@@ -6,10 +6,14 @@ import Foundation
 /// What a session looks like on macOS:
 /// - Claude Code: an executable named `claude` — the Claude desktop app's bundled copy
 ///   (…/Claude/claude-code/<version>/<hash>/claude.app/Contents/MacOS/claude), Homebrew's, or
-///   npm's native package. The native installer's `~/.local/bin/claude` is a symlink to
-///   `~/.local/share/claude/versions/<version>`, and macOS reports the resolved file, so the
-///   executable is then named after the version. npm's JavaScript build runs as
-///   `node …/@anthropic-ai/claude-code/cli.js` (or `node …/bin/claude` through npm's link).
+///   the platform binary of npm's package. The native installer's `~/.local/bin/claude` is a
+///   symlink to `~/.local/share/claude/versions/<version>`, and macOS reports the resolved file,
+///   so the executable is then named after the version. npm's package (2.1.120 on) hardlinks or
+///   copies its platform binary to `…/@anthropic-ai/claude-code/bin/claude.exe`, which npm's
+///   `claude` link points at, so macOS reports that name. npm's older JavaScript build (up to
+///   2.1.100) runs as `node …/@anthropic-ai/claude-code/cli.js` (or `node …/bin/claude` through
+///   npm's link) until it sets its process title to "claude" as it starts a command: Node then
+///   writes the title over the whole argv, which becomes ["claude", "", …].
 /// - Codex: an executable named `codex` (npm's vendored binary, Homebrew's formula, the Codex
 ///   app's bundled CLI) or `codex-<arch>-apple-darwin` (release archives and Homebrew's cask),
 ///   or npm's launcher `node …/@openai/codex/bin/codex.js`, which runs the vendored binary as
@@ -23,6 +27,9 @@ import Foundation
 /// another program: Claude Code runs its own binary as `ugrep`/`rg` for its shell's grep, as
 /// `claude bg-pty-host` and as a `gh` shim, Codex runs its own as `apply_patch`; argv[0] then
 /// names that program. (The helper modes were read from Claude Code 2.1.289's entry point.)
+/// The JavaScript build's helpers title themselves differently ("claude daemon"), but its
+/// housekeeping commands don't, so one seen only after renaming itself (`claude mcp serve`)
+/// passes for a session.
 enum CodingSessionMatcher {
     typealias Tool = CodingSessionMonitor.Tool
 
@@ -89,11 +96,18 @@ enum CodingSessionMatcher {
             guard runsAsItself(tool, executablePath: executablePath, argv0: arguments.first) else { return nil }
             return isSession(tool, arguments: arguments.dropFirst()) ? tool : nil
         }
-        guard isScriptRuntime(executablePath),
-              let scriptIndex = nodeScriptIndex(in: arguments),
+        guard isScriptRuntime(executablePath) else { return nil }
+        if isRenamedClaudeCode(arguments) { return .claudeCode }
+        guard let scriptIndex = nodeScriptIndex(in: arguments),
               let tool = scriptTool(arguments[scriptIndex])
         else { return nil }
         return isSession(tool, arguments: arguments[(scriptIndex + 1)...]) ? tool : nil
+    }
+
+    /// Whether a script runtime's argv names the script it runs, so the process is known for what
+    /// it is: its argv can only change from here by renaming itself.
+    static func runsNamedScript(executablePath: String, arguments: [String]) -> Bool {
+        isScriptRuntime(executablePath) && nodeScriptIndex(in: arguments) != nil
     }
 
     // MARK: - Helpers
@@ -104,6 +118,14 @@ enum CodingSessionMatcher {
         let components = path.split(separator: "/", omittingEmptySubsequences: true)
         guard let name = components.last else { return nil }
         if name == "claude" { return .claudeCode }
+        // …/@anthropic-ai/claude-code/bin/claude.exe, npm's package: the package uses this one
+        // name on every platform.
+        if name == "claude.exe", components.count >= 4,
+           components[components.count - 2] == "bin",
+           components[components.count - 3] == "claude-code",
+           components[components.count - 4] == "@anthropic-ai" {
+            return .claudeCode
+        }
         // …/claude/versions/2.1.0, the native installer's layout.
         if components.count >= 3,
            components[components.count - 2] == "versions",
@@ -134,6 +156,13 @@ enum CodingSessionMatcher {
         if name.hasPrefix("cli"), isInsidePackage(components, scope: "@anthropic-ai", name: "claude-code") { return .claudeCode }
         if name.hasPrefix("codex"), isInsidePackage(components, scope: "@openai", name: "codex") { return .codex }
         return nil
+    }
+
+    /// The argv npm's JavaScript build of Claude Code leaves after setting its process title:
+    /// "claude", then an empty string for each argument it was started with. Its helpers'
+    /// titles differ ("claude daemon"), so they don't match.
+    static func isRenamedClaudeCode(_ arguments: [String]) -> Bool {
+        arguments.count > 1 && arguments[0] == "claude" && arguments.dropFirst().allSatisfy(\.isEmpty)
     }
 
     /// The index in `arguments` of the script node runs, or nil when it runs none (a REPL, inline
