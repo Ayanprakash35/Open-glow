@@ -51,18 +51,37 @@ private func updating(_ info: [AnyHashable: Any], _ changes: [AnyHashable: Any?]
 }
 
 private let nightcall = Track(player: .music, id: "BED468AC7302C9C9", title: "Nightcall", artist: "Kavinsky", album: "OutRun")
+/// Nightcall as Music's notification describes it: it names no file, so it's streamed.
+private let streamedNightcall = Track(player: .music, id: "BED468AC7302C9C9", title: "Nightcall", artist: "Kavinsky", album: "OutRun", isLocalFile: false)
 private let midnightCity = Track(player: .spotify, id: "spotify:track:1eyzqe2QqGZUmfcPZtrIyt", title: "Midnight City", artist: "M83", album: "Hurry Up, We're Dreaming")
 
 @Suite("Now playing: notifications")
 struct NowPlayingNotificationTests {
     @Test func musicPlaying() {
         let event = Monitor.parseNotification(name: musicName, userInfo: musicPlayingInfo)
-        #expect(event == .init(player: .music, state: .playing, track: nightcall))
+        #expect(event == .init(player: .music, state: .playing, track: streamedNightcall))
     }
 
     @Test func musicPausedKeepsTheTrack() {
         let event = Monitor.parseNotification(name: musicName, userInfo: updating(musicPlayingInfo, ["Player State": "Paused"]))
-        #expect(event == .init(player: .music, state: .paused, track: nightcall))
+        #expect(event == .init(player: .music, state: .paused, track: streamedNightcall))
+    }
+
+    /// Music names a file location for local files only; streamed tracks come without one.
+    @Test func musicSaysWhetherATrackIsALocalFile() {
+        let local = updating(musicPlayingInfo, ["Location": "file:///Users/me/Music/Media/Kavinsky/OutRun/02%20Nightcall.m4a"])
+        #expect(Monitor.parseNotification(name: musicName, userInfo: local)?.track?.isLocalFile == true)
+        let asURL = updating(musicPlayingInfo, ["Location": URL(fileURLWithPath: "/Users/me/Music/02 Nightcall.m4a")])
+        #expect(Monitor.parseNotification(name: musicName, userInfo: asURL)?.track?.isLocalFile == true)
+        let asPath = updating(musicPlayingInfo, ["Location": "/Users/me/Music/02 Nightcall.m4a"])
+        #expect(Monitor.parseNotification(name: musicName, userInfo: asPath)?.track?.isLocalFile == true)
+        #expect(Monitor.parseNotification(name: musicName, userInfo: musicPlayingInfo)?.track?.isLocalFile == false)
+        let web = updating(musicPlayingInfo, ["Location": "https://example.com/stream.mp3"])
+        #expect(Monitor.parseNotification(name: musicName, userInfo: web)?.track?.isLocalFile == false)
+        let odd = updating(musicPlayingInfo, ["Location": 42])
+        #expect(Monitor.parseNotification(name: musicName, userInfo: odd)?.track?.isLocalFile == false)
+        // Spotify doesn't say.
+        #expect(Monitor.parseNotification(name: spotifyName, userInfo: spotifyPlayingInfo)?.track?.isLocalFile == nil)
     }
 
     /// Music's stopped notification carries little more than the state.
@@ -171,6 +190,23 @@ struct NowPlayingRecordTests {
 
         record.apply(.init(state: .paused, track: midnightCity), change: 10)
         #expect(record.lastChange == 10)
+    }
+
+    /// A script can't tell a file from a stream, so confirming a track keeps what its
+    /// notification said, and isn't counted as a change.
+    @Test func aSnapshotKeepsWhatTheNotificationSaidAboutTheFile() {
+        var local = nightcall
+        local.isLocalFile = true
+        var record = Record(isRunning: true, state: .playing, track: local, lastChange: 4)
+        record.apply(.init(state: .playing, track: nightcall), change: 9)
+        #expect(record.track?.isLocalFile == true)
+        #expect(record.lastChange == 4)
+
+        // A different track from the script: nothing is known about it.
+        let other = Track(player: .music, id: "0000000000000001", title: "Other", artist: "A", album: "B")
+        record.apply(.init(state: .playing, track: other), change: 11)
+        #expect(record.track?.isLocalFile == nil)
+        #expect(record.lastChange == 11)
     }
 }
 
