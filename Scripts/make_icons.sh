@@ -4,15 +4,24 @@
 # Usage: Scripts/make_icons.sh <app-icon.png> [<menu-bar-icon.png>]
 #   app-icon.png       square, ideally 1024×1024 — becomes Resources/AppIcon.icns
 #   menu-bar-icon.png  optional; a black shape on transparency, ideally 36 px tall or more —
-#                      becomes Resources/MenuBarIcon.png and MenuBarIcon@2x.png. macOS tints it
-#                      to match light and dark menu bars (it's used as a template image).
+#                      becomes Resources/MenuBarIcon.png (18 px tall) and MenuBarIcon@2x.png
+#                      (36 px), drawn as a template image that macOS tints to match light and dark
+#                      menu bars.
 #
-# Scripts/build_app.sh copies whatever icons exist into the app bundle.
+# Scripts/build_app.sh copies whichever of these exist into the app bundle on every build, and
+# names AppIcon.icns as the bundle's icon (CFBundleIconFile). Delete them to go back to the
+# generic icon.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_ICON="${1:?Usage: Scripts/make_icons.sh <app-icon.png> [<menu-bar-icon.png>]}"
 MENU_ICON="${2:-}"
+for input in "$APP_ICON" ${MENU_ICON:+"$MENU_ICON"}; do
+    if [[ ! -f "$input" ]]; then
+        echo "No such file: $input" >&2
+        exit 1
+    fi
+done
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
