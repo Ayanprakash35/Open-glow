@@ -16,6 +16,9 @@ private let desktopClaudeArguments = [
 ]
 private let nativeClaude = "/Users/me/.local/share/claude/versions/2.1.289"
 private let brewClaude = "/opt/homebrew/Caskroom/claude-code/2.1.289/claude"
+/// npm's package since 2.1.120: the platform binary, hardlinked or copied under this name.
+private let npmClaude = "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+/// npm's JavaScript build, up to 2.1.100.
 private let npmClaudeScript = "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js"
 private let node = "/opt/homebrew/bin/node"
 private let systemNode = "/usr/local/bin/node"
@@ -42,7 +45,41 @@ struct CodingSessionMatchingTests {
         #expect(match(nativeClaude, ["claude"]) == .claudeCode)
         #expect(match(nativeClaude, ["claude", "--continue"]) == .claudeCode)
         #expect(match(brewClaude, ["claude", "-p", "summarize the diff"]) == .claudeCode)
+    }
+
+    /// npm's package runs its platform binary as `bin/claude.exe`, through npm's `claude` link.
+    @Test func claudeCodeFromNpm() {
+        #expect(match(npmClaude, ["claude"]) == .claudeCode)
+        #expect(match(npmClaude, ["claude", "--resume"]) == .claudeCode)
+        #expect(match(npmClaude, [npmClaude, "fix the tests"]) == .claudeCode)
+        #expect(match("/Users/me/.nvm/versions/node/v22.12.0/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe", ["claude"]) == .claudeCode)
+        #expect(match("/Users/me/Library/pnpm/global/5/.pnpm/@anthropic-ai+claude-code@2.1.293/node_modules/@anthropic-ai/claude-code/bin/claude.exe", ["claude"]) == .claudeCode)
+        // The platform package's own binary, run directly.
         #expect(match("/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code-darwin-arm64/claude") == .claudeCode)
+        // Housekeeping and stand-ins, as for every other install.
+        #expect(match(npmClaude, ["claude", "mcp", "serve"]) == nil)
+        #expect(match(npmClaude, ["claude", "--version"]) == nil)
+        #expect(match(npmClaude, ["claude daemon", "--daemon-worker", "agents"]) == nil)
+        #expect(match(npmClaude, ["ugrep", "-G", "-E", "TODO"]) == nil)
+    }
+
+    /// npm's JavaScript build sets its process title to "claude" as it starts a command, and
+    /// Node writes that over its whole argv.
+    @Test func renamedJavaScriptBuild() {
+        #expect(match(node, ["claude", ""]) == .claudeCode)
+        #expect(match(systemNode, ["claude", "", "", ""]) == .claudeCode)
+        // Its helpers title themselves differently.
+        #expect(match(node, ["claude daemon", ""]) == nil)
+        #expect(match(node, ["claude daemon", "", "", ""]) == nil)
+        #expect(match(node, ["claude bg-pty-host", "", ""]) == nil)
+        // Only a bare "claude" over nothing but empty strings: not a node merely started as `claude`.
+        #expect(match(node, ["claude"]) == nil)
+        #expect(match(node, ["claude", "", "/Users/me/projects/site/server.js"]) == nil)
+        #expect(match(node, ["claude", "/Users/me/projects/site/server.js"]) == nil)
+        // Only node is renamed this way.
+        #expect(match("/usr/bin/python3", ["claude", ""]) == nil)
+        #expect(Matcher.isRenamedClaudeCode(["claude", ""]))
+        #expect(!Matcher.isRenamedClaudeCode(["claude daemon", ""]))
     }
 
     @Test func claudeCodeThroughNode() {
@@ -98,6 +135,11 @@ struct CodingSessionMatchingTests {
         #expect(match("/Users/me/bin/claude-helper") == nil)
         #expect(match("/Users/me/bin/codex-cli-wrapper") == nil)
         #expect(!Matcher.isCandidate(executablePath: "/Users/me/claude/.build/debug/app"))
+        // `claude.exe` counts only inside npm's package.
+        #expect(match("/Users/me/bin/claude.exe", ["claude"]) == nil)
+        #expect(match("/Users/me/src/claude-code/bin/claude.exe", ["claude"]) == nil)
+        #expect(match("/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/claude.exe", ["claude"]) == nil)
+        #expect(!Matcher.isCandidate(executablePath: "/Users/me/bin/claude.exe"))
     }
 
     @Test func housekeepingIsNotASession() {
@@ -385,6 +427,41 @@ struct CodingSessionTrackingTests {
         #expect(tracker.scan(table, now: 3) == [.claudeCode])
     }
 
+    /// npm's JavaScript build is usually first seen already renamed to "claude"; either way, its
+    /// session is reported once.
+    @Test func theRenamedJavaScriptBuildIsReported() {
+        let table = desktop()
+        var tracker = CodingSessionTracker(cooldown: 0)
+        _ = tracker.scan(table, now: 0)
+        table.launch(1300, node, ["claude", ""], parent: 102)
+        #expect(tracker.scan(table, now: 1.5) == [.claudeCode])
+        // Seen before renaming itself, then renamed.
+        table.launch(1301, node, ["node", "/opt/homebrew/bin/claude", "--continue"], parent: 102)
+        #expect(tracker.scan(table, now: 3) == [.claudeCode])
+        table.launch(1301, node, ["claude", "", ""], parent: 102)
+        #expect(tracker.scan(table, now: 4.5).isEmpty)
+        #expect(tracker.runningSessions == [.claudeCode: 3])
+    }
+
+    /// A housekeeping command of the JavaScript build seen before it renamed itself isn't taken
+    /// for a session once it has.
+    @Test func renamedHousekeepingSeenBeforeIsIgnored() {
+        let table = desktop()
+        var tracker = CodingSessionTracker(cooldown: 0)
+        _ = tracker.scan(table, now: 0)
+        _ = table.takeReads()
+        table.launch(1400, node, ["node", npmClaudeScript, "mcp", "serve"], parent: 1)
+        table.launch(1401, node, ["node", npmClaudeScript, "daemon"], parent: 1)
+        #expect(tracker.scan(table, now: 1.5).isEmpty)
+        #expect(table.takeReads() == .init(paths: 2, arguments: 2))
+        table.launch(1400, node, ["claude", "", "", ""], parent: 1)
+        table.launch(1401, node, ["claude daemon", "", ""], parent: 1)
+        #expect(tracker.scan(table, now: 3).isEmpty)
+        // Known for what they are after one look.
+        #expect(table.takeReads() == .init(paths: 0, arguments: 0))
+        #expect(tracker.runningSessions == [.claudeCode: 1])
+    }
+
     /// Paths are read only for PIDs not seen before (and once more on the next scan), arguments
     /// only for likely executables.
     @Test func onlyNewProcessesAreLookedAt() {
@@ -406,23 +483,35 @@ struct CodingSessionTrackingTests {
         #expect(table.takeReads() == .init(paths: 1, arguments: 0))
         _ = tracker.scan(table, now: 6)
         #expect(table.takeReads() == .init(paths: 0, arguments: 0))
+
+        // A script runtime running a script that isn't a session gets one look; one whose argv
+        // names no script (`npm exec`'s) gets two.
+        table.launch(1202, node, ["node", "/Users/me/projects/site/server.js"], parent: 102)
+        table.launch(1203, systemNode, ["npm exec @modelcontextprotocol/server-pdf --stdio", "", ""], parent: 102)
+        _ = tracker.scan(table, now: 7.5)
+        #expect(table.takeReads() == .init(paths: 2, arguments: 2))
+        _ = tracker.scan(table, now: 9)
+        #expect(table.takeReads() == .init(paths: 1, arguments: 1))
+        _ = tracker.scan(table, now: 10.5)
+        #expect(table.takeReads() == .init(paths: 0, arguments: 0))
     }
 }
 
 // MARK: - Monitor
 
+/// Waits up to `timeout` for `condition`.
+@MainActor
+private func waitUntil(timeout: Duration = .seconds(10), _ condition: () -> Bool) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now + timeout
+    while !condition(), clock.now < deadline {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+}
+
 @Suite("Coding sessions: monitor")
 @MainActor
 struct CodingSessionMonitorTests {
-    /// Waits up to `timeout` for `condition`.
-    private func waitUntil(timeout: Duration = .seconds(3), _ condition: () -> Bool) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now + timeout
-        while !condition(), clock.now < deadline {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-    }
-
     @Test func reportsNewSessionsOnTheMainActor() async throws {
         let table = desktop()
         let monitor = CodingSessionMonitor(table: table, interval: 0.02, tolerance: 0, cooldown: 0)
@@ -543,6 +632,61 @@ struct CodingSessionLiveTests {
         #expect(tracker.scan(table, now: 2).isEmpty)
     }
 
+    /// npm's package layout: the binary at `…/@anthropic-ai/claude-code/bin/claude.exe`, copied or
+    /// hardlinked from the platform package, run through npm's `claude` symlink.
+    @Test(arguments: [false, true])
+    func spotsTheNpmPackage(hardlinked: Bool) throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "OpenGlowTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let modules = directory.appending(path: "lib/node_modules/@anthropic-ai")
+        let binFolder = modules.appending(path: "claude-code/bin")
+        try FileManager.default.createDirectory(at: binFolder, withIntermediateDirectories: true)
+        let binary = binFolder.appending(path: "claude.exe").path
+        if hardlinked {
+            let platform = modules.appending(path: "claude-code-darwin-arm64")
+            try FileManager.default.createDirectory(at: platform, withIntermediateDirectories: true)
+            try FileManager.default.linkItem(atPath: try makeStandIn(named: "claude", in: platform), toPath: binary)
+        } else {
+            _ = try makeStandIn(named: "claude.exe", in: binFolder)
+        }
+        let link = directory.appending(path: "bin/claude").path
+        try FileManager.default.createDirectory(at: directory.appending(path: "bin"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: "../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe")
+
+        let table = LiveProcessTable()
+        let session = try launchOrphan(link, ["claude", "20"])
+        defer { kill(session, SIGKILL) }
+        let path = try #require(table.executablePath(of: session))
+        // A copy can only be reported under its own name; macOS may report either name of a hardlink.
+        if !hardlinked { #expect(path.hasSuffix("/claude-code/bin/claude.exe"), "\(path)") }
+        #expect(CodingSessionTracker.classify(session, in: table) == .claudeCode, "\(path)")
+    }
+
+    /// npm's JavaScript build renames itself "claude" (its daemon "claude daemon"), and Node writes
+    /// the title over the whole argv. Needs Node; a stand-in script does the renaming.
+    @Test(.enabled(if: installedNode != nil))
+    func spotsTheRenamedJavaScriptBuild() async throws {
+        let node = try #require(installedNode)
+        let directory = FileManager.default.temporaryDirectory.appending(path: "OpenGlowTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let package = directory.appending(path: "lib/node_modules/@anthropic-ai/claude-code")
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        let script = package.appending(path: "cli.js").path
+        try #"process.title = process.argv[2] === "daemon" ? "claude daemon" : "claude"; setTimeout(() => {}, 20000);"#
+            .write(toFile: script, atomically: true, encoding: .utf8)
+
+        let table = LiveProcessTable()
+        let session = try launchOrphan(node, ["node", script, "--continue"])
+        let daemon = try launchOrphan(node, ["node", script, "daemon"])
+        defer { for pid in [session, daemon] { kill(pid, SIGKILL) } }
+        try await waitUntil {
+            table.arguments(of: session)?.first == "claude" && table.arguments(of: daemon)?.first == "claude daemon"
+        }
+        #expect(table.arguments(of: session) == ["claude", "", ""])
+        #expect(CodingSessionTracker.classify(session, in: table) == .claudeCode)
+        #expect(CodingSessionTracker.classify(daemon, in: table) == nil)
+    }
+
     @Test func scansQuickly() {
         let table = LiveProcessTable()
         let clock = ContinuousClock()
@@ -556,6 +700,11 @@ struct CodingSessionLiveTests {
         #expect(baseline < .milliseconds(100), "baseline \(baseline)")
         #expect(steady < .milliseconds(5), "steady \(steady)")
     }
+}
+
+/// Node, where the usual installs put it, for the tests that need a real one.
+private let installedNode = ["/opt/homebrew/bin/node", "/usr/local/bin/node"].first {
+    FileManager.default.isExecutableFile(atPath: $0)
 }
 
 /// A stand-in for a tool's binary: a copy of `sleep` named `name`, re-signed ad hoc so it may run
