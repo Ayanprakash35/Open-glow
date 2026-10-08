@@ -129,12 +129,7 @@ enum TimerMenu {
     }
 
     private static func actionItem(_ title: String, action: @escaping () -> Void) -> NSMenuItem {
-        let handler = MenuAction(action)
-        let item = NSMenuItem(title: title, action: #selector(MenuAction.runAction(_:)), keyEquivalent: "")
-        item.target = handler
-        // `target` is weak; the item keeps its handler alive through this.
-        item.representedObject = handler
-        return item
+        NSMenuItem(title: title, run: action)
     }
 
     // MARK: Menu bar
@@ -283,19 +278,5 @@ extension TimerMenu.Actions {
     /// Asks for a length and starts it; does nothing if the user cancels.
     func startCustomCountdown() {
         if let minutes = askForCustomMinutes() { startCountdown(minutes: minutes) }
-    }
-}
-
-/// Runs a closure as a menu item's action.
-@MainActor
-private final class MenuAction: NSObject {
-    private let run: () -> Void
-
-    init(_ run: @escaping () -> Void) {
-        self.run = run
-    }
-
-    @objc func runAction(_ sender: Any?) {
-        run()
     }
 }

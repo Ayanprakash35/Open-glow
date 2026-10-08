@@ -37,9 +37,10 @@ final class DisplayManager {
     private let settings = Settings.shared
     private(set) var palette: GlowPalette = .fallback
 
-    /// Called after the set of displays changes (connect, disconnect, reconfiguration).
+    /// The running timer's remaining share, for displays that connect while it runs.
     private var timerFraction: Double?
 
+    /// Called after the set of displays changes (connect, disconnect, reconfiguration).
     var onDisplaysChanged: (() -> Void)?
 
     /// Whether any overlay is meant to be on screen, by the settings — capture has no reason to

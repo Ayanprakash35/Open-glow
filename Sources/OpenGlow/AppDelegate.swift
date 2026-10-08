@@ -11,6 +11,11 @@ private let popoverRefreshInterval: TimeInterval = 0.5
 /// preflight query. Sane range: 1–5.
 private let capturingStatusRefreshInterval: TimeInterval = 2
 
+/// Height of the app's own menu-bar logo (Resources/MenuBarIcon.png), in points. Menu-bar glyphs
+/// are about 18 pt tall; Scripts/make_icons.sh makes the logo that size already, so this only
+/// tames a logo dropped in at another size. Sane range: 16–22.
+private let menuBarLogoHeight: CGFloat = 18
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let logger = Logger(subsystem: "com.openglow.app", category: "App")
@@ -27,6 +32,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var sessionMonitor: ScreenSessionMonitor!
     private var codingSessionGlow: CodingSessionGlow!
     private var timers: TimerPresenter!
+    /// The app's own logo for the everyday menu-bar icon, when the bundle has one; builds without
+    /// it (`swift run` among them) show the SF Symbol.
+    private lazy var menuBarLogo: NSImage? = Self.loadMenuBarLogo()
     /// Created the first time the tour opens and kept: its `finish` runs while its window closes.
     private var onboarding: OnboardingWindowController?
     private var onboardingRefreshTimer: Timer?
@@ -46,7 +54,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         setUpStatusItem()
-        setUpPopover()
 
         // Everything `refreshStatus()` reads exists before anything below can trigger it.
         audioEngine = AudioEngine()
@@ -56,6 +63,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         colorCoordinator = ColorCoordinator(settings: settings, displayManager: displayManager)
         codingSessionGlow = CodingSessionGlow(displayManager: displayManager)
         timers = TimerPresenter(displayManager: displayManager, statusItem: statusItem)
+        // The popover shows the timer's section, so it comes after the presenter.
+        setUpPopover()
         timers.onCountdownEnded = { [weak self] in self?.refreshStatus() }
 
         displayManager.applyBaseAppearanceToAll()
@@ -104,6 +113,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         button.target = self
         button.action = #selector(statusItemClicked(_:))
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        // The button widens and narrows as a timer's countdown comes and goes, which a timer
+        // started from the popover does while it's open.
+        button.postsFrameChangedNotifications = true
+        NotificationCenter.default.addObserver(self, selector: #selector(statusButtonResized), name: NSView.frameDidChangeNotification, object: button)
     }
 
     private func setUpPopover() {
@@ -112,7 +125,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.delegate = self
         let actions = SettingsActions(
             grantScreenRecording: { [weak self] in self?.grantAccess() },
-            openScreenRecordingSettings: { [weak self] in self?.openPrivacySettings() },
             openAutomationSettings: { [weak self] in self?.openAutomationSettings() },
             retryNowPlaying: { [weak self] in self?.colorCoordinator.refreshNowPlaying() },
             relaunch: { [weak self] in self?.relaunch() },
@@ -121,9 +133,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             quit: { NSApp.terminate(nil) },
             openTour: { [weak self] in self?.showOnboarding() }
         )
-        let host = NSHostingController(rootView: SettingsView(settings: settings, status: statusModel, actions: actions))
+        // The Custom… length is asked in a modal alert. Closing the popover first keeps it from
+        // sitting half-dismissed behind the alert; the right-click menu has its own actions.
+        timers.panelModel.actions.askForCustomMinutes = { [weak self] in
+            self?.popover.performClose(nil)
+            return TimerMenu.promptForCustomMinutes()
+        }
+        let view = SettingsView(settings: settings, status: statusModel, timer: timers.panelModel, actions: actions)
+        let host = NSHostingController(rootView: view)
         host.sizingOptions = .preferredContentSize
         popover.contentViewController = host
+    }
+
+    /// Keeps the popover's arrow on the button as the button changes width.
+    @objc private func statusButtonResized() {
+        // Optional: the button exists, and can be laid out, before the popover does.
+        guard popover?.isShown == true, let button = statusItem.button else { return }
+        popover.positioningRect = button.bounds
     }
 
     @objc private func statusItemClicked(_ sender: NSStatusItem?) {
@@ -140,11 +166,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func togglePopover() {
-        guard let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(nil)
-            return
+        } else {
+            showPopover()
         }
+    }
+
+    private func showPopover() {
+        guard let button = statusItem.button, !popover.isShown else { return }
         // Opening the popover is the primary click, so it re-checks too — a grant made in
         // System Settings should take effect here, not only from the right-click menu.
         userAskedToRetry()
@@ -198,144 +228,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // CGRequestScreenCaptureAccess (see AudioEngine).
         userAskedToRetry()
 
-        let menu = NSMenu()
-
-        let toggleItem = NSMenuItem(title: settings.isEnabled ? "Turn Off" : "Turn On", action: #selector(toggleEnabled), keyEquivalent: "")
-        toggleItem.target = self
-        menu.addItem(toggleItem)
-
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
-        settingsItem.target = self
-        menu.addItem(settingsItem)
-
-        menu.addItem(.separator())
-
-        menu.addItem(animationMenuItem())
-        menu.addItem(stereoMenuItem())
-        menu.addItem(displaysMenuItem())
-        menu.addItem(notchMenuItem())
-
-        menu.addItem(.separator())
-        menu.addItem(timers.menuItem())
-
-        let attentionItems = attentionMenuItems()
-        if !attentionItems.isEmpty {
-            menu.addItem(.separator())
-            attentionItems.forEach(menu.addItem)
-        }
-
-        menu.addItem(.separator())
-
-        let tourItem = NSMenuItem(title: "Welcome Tour…", action: #selector(openTour), keyEquivalent: "")
-        tourItem.target = self
-        menu.addItem(tourItem)
-
-        let quitItem = NSMenuItem(title: "Quit Open Glow", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quitItem)
+        let state = StatusMenu.State(
+            displays: displayManager.displays,
+            musicSync: musicSyncStatus(),
+            glowVisible: displayManager.hasVisibleOverlay,
+            launchAtLogin: LaunchAtLogin.state
+        )
+        let menu = StatusMenu.make(settings: settings, state: state, timerItem: timers.menuItem(), actions: menuActions())
 
         // Pop the menu at the button's location directly, rather than assigning it to
         // statusItem.menu, so left-click keeps opening the popover instead of this menu.
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
     }
 
-    private func animationMenuItem() -> NSMenuItem {
-        let item = NSMenuItem(title: "Animation", action: nil, keyEquivalent: "")
-        let submenu = NSMenu()
-        for (title, mode) in [("Music Sync", AnimationMode.musicSync), ("Flow", .flow), ("Steady", .steady)] {
-            let modeItem = NSMenuItem(title: title, action: #selector(setAnimationMode(_:)), keyEquivalent: "")
-            modeItem.target = self
-            modeItem.representedObject = mode
-            modeItem.state = settings.animationMode == mode ? .on : .off
-            submenu.addItem(modeItem)
-        }
-        item.submenu = submenu
-        return item
-    }
-
-    private func stereoMenuItem() -> NSMenuItem {
-        let item = NSMenuItem(title: "Stereo Mode", action: #selector(toggleStereoMode), keyEquivalent: "")
-        item.target = self
-        item.state = settings.stereoModeEnabled ? .on : .off
-        return item
-    }
-
-    private func displaysMenuItem() -> NSMenuItem {
-        let item = NSMenuItem(title: "Displays", action: nil, keyEquivalent: "")
-        let submenu = NSMenu()
-        for display in displayManager.displays {
-            let displayItem = NSMenuItem(title: display.name, action: #selector(toggleDisplay(_:)), keyEquivalent: "")
-            displayItem.target = self
-            displayItem.representedObject = display.uuid
-            displayItem.state = settings.isDisplayEnabled(uuid: display.uuid) ? .on : .off
-            submenu.addItem(displayItem)
-        }
-        item.submenu = submenu
-        return item
-    }
-
-    private func notchMenuItem() -> NSMenuItem {
-        let item = NSMenuItem(title: "Notch", action: nil, keyEquivalent: "")
-        let submenu = NSMenu()
-        for (title, mode) in [("Curve Around", NotchMode.curveAround), ("Ignore", .ignore)] {
-            let modeItem = NSMenuItem(title: title, action: #selector(setNotchMode(_:)), keyEquivalent: "")
-            modeItem.target = self
-            modeItem.representedObject = mode
-            modeItem.state = settings.notchMode == mode ? .on : .off
-            submenu.addItem(modeItem)
-        }
-        item.submenu = submenu
-        return item
-    }
-
-    /// Shown whenever Music Sync can't work — never fail silently.
-    private func attentionMenuItems() -> [NSMenuItem] {
-        let status = musicSyncStatus()
-        guard status.needsAttention else { return [] }
-        let relaunchItem = NSMenuItem(title: "Relaunch Open Glow", action: #selector(relaunch), keyEquivalent: "")
-        relaunchItem.target = self
-        let primary: NSMenuItem
-        switch status {
-        case .needsPermission:
-            primary = NSMenuItem(title: "Grant Screen Recording Access…", action: #selector(grantAccess), keyEquivalent: "")
-        case .captureUnreadable:
-            // Not a permission problem: a fresh capture is the only thing worth offering.
-            return [relaunchItem]
-        default:
-            primary = NSMenuItem(title: "Open Privacy & Security…", action: #selector(openPrivacySettings), keyEquivalent: "")
-        }
-        primary.target = self
-        return [primary, relaunchItem]
-    }
-
-    @objc private func toggleEnabled() {
-        settings.isEnabled.toggle()
-    }
-
-    @objc private func openTour() {
-        showOnboarding()
-    }
-
-    @objc private func openSettings() {
-        togglePopover()
-    }
-
-    @objc private func toggleDisplay(_ sender: NSMenuItem) {
-        guard let uuid = sender.representedObject as? String else { return }
-        settings.setDisplayEnabled(!settings.isDisplayEnabled(uuid: uuid), uuid: uuid)
-    }
-
-    @objc private func setNotchMode(_ sender: NSMenuItem) {
-        guard let mode = sender.representedObject as? NotchMode else { return }
-        settings.notchMode = mode
-    }
-
-    @objc private func setAnimationMode(_ sender: NSMenuItem) {
-        guard let mode = sender.representedObject as? AnimationMode else { return }
-        settings.animationMode = mode
-    }
-
-    @objc private func toggleStereoMode() {
-        settings.stereoModeEnabled.toggle()
+    private func menuActions() -> StatusMenu.Actions {
+        StatusMenu.Actions(
+            openSettings: { [weak self] in self?.showPopover() },
+            grantScreenRecording: { [weak self] in self?.grantAccess() },
+            relaunch: { [weak self] in self?.relaunch() },
+            previewCodingSession: { [weak self] tool in self?.displayManager.playAccent(tool.palette) },
+            setLaunchAtLogin: { [weak self] enabled in self?.setLaunchAtLoginFromMenu(enabled) },
+            openLoginItems: { LaunchAtLogin.openLoginItemsSettings() },
+            openTour: { [weak self] in self?.showOnboarding() },
+            quit: { NSApp.terminate(nil) }
+        )
     }
 
     // MARK: - Settings
@@ -380,8 +296,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         refreshStatus()
     }
 
+    /// Watches for coding sessions only while one could glow: the option on, at least one tool
+    /// chosen, and Open Glow on. With no tool chosen the process table isn't read at all.
     private func updateCodingSessionGlow() {
-        codingSessionGlow.update(enabled: settings.codingSessionGlow && settings.isEnabled)
+        let anyTool = CodingSessionMonitor.Tool.allCases.contains { settings.glowsForCodingSession($0) }
+        codingSessionGlow.update(enabled: anyTool && settings.isEnabled)
     }
 
     // MARK: - Welcome tour
@@ -424,6 +343,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         refreshStatus()
     }
 
+    /// The popover and the tour show a failure under their toggle; the menu has closed by now,
+    /// so a failure from it gets an alert instead of passing unseen.
+    private func setLaunchAtLoginFromMenu(_ enabled: Bool) {
+        setLaunchAtLogin(enabled)
+        guard let error = statusModel.launchAtLoginError else { return }
+        let alert = NSAlert()
+        alert.messageText = enabled ? "Open Glow couldn't turn on Launch at Login" : "Open Glow couldn't turn off Launch at Login"
+        alert.informativeText = error
+        // A menu-bar app isn't frontmost; without this the alert opens behind other windows.
+        NSApp.activate()
+        alert.runModal()
+    }
+
     // MARK: - Status
 
     private func musicSyncStatus() -> MusicSyncStatus {
@@ -454,30 +386,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             statusModel.systemReducesMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         }
 
-        // While a timer runs, its countdown takes the icon's place.
+        let icon = StatusIcon(status: status, glowEnabled: settings.isEnabled)
+        // While a timer runs, its countdown takes the icon's place, so a warning has to travel
+        // with the countdown or nothing in the menu bar would show it.
+        timers.attention = icon.timerAttention
         guard let button = statusItem.button, !timers.isRunning else { return }
-        let symbol: String
-        let description: String
-        switch status {
-        case .off:
-            symbol = "light.min"
-            description = "Open Glow — off"
-        case .needsPermission:
-            symbol = "exclamationmark.triangle"
-            description = "Open Glow needs Screen & System Audio Recording access for Music Sync"
-        case .captureFailed:
-            symbol = "exclamationmark.triangle"
-            description = "Open Glow can't capture audio for Music Sync"
-        case .captureUnreadable:
-            symbol = "exclamationmark.triangle"
-            description = "Open Glow can't read the captured audio for Music Sync"
-        default:
-            symbol = "light.max"
-            description = "Open Glow"
+        button.image = image(for: icon)
+        button.appearsDisabled = icon.appearsDisabled
+        button.toolTip = icon.description
+    }
+
+    /// The logo for the everyday icon when the bundle has one; the SF Symbol otherwise, and for
+    /// the off and warning states, which have to read differently.
+    private func image(for icon: StatusIcon) -> NSImage? {
+        if icon.isNormal, let logo = menuBarLogo {
+            logo.accessibilityDescription = icon.description
+            return logo
         }
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)
-        button.appearsDisabled = status == .off
-        button.toolTip = description
+        return NSImage(systemSymbolName: icon.symbol, accessibilityDescription: icon.description)
+    }
+
+    private static func loadMenuBarLogo() -> NSImage? {
+        guard let logo = Bundle.main.image(forResource: "MenuBarIcon"), logo.size.height > 0 else { return nil }
+        // A template image: macOS tints it for light and dark menu bars, and dims it like a symbol.
+        logo.isTemplate = true
+        if logo.size.height != menuBarLogoHeight {
+            logo.size = NSSize(width: logo.size.width * menuBarLogoHeight / logo.size.height, height: menuBarLogoHeight)
+        }
+        return logo
     }
 
     // MARK: - Permission actions
@@ -485,18 +421,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// Registers Open Glow with the privacy system (which may show macOS's own prompt) and opens
     /// the Screen & System Audio Recording pane, so the click always leads somewhere visible —
     /// if access was already denied, macOS won't prompt again and the pane is the only way on.
-    @objc private func grantAccess() {
+    private func grantAccess() {
         popover.performClose(nil)
         Task {
             await audioEngine.registerForScreenRecording()
+            // Read before the retry below: it clears ScreenCaptureKit's refusal, after which the
+            // state where macOS's preflight says yes but capture is refused (a grant made while
+            // Open Glow runs) reads as granted, and the click would lead nowhere.
+            let accessMissing = audioEngine.permissionState != .granted
             userAskedToRetry()
-            if audioEngine.permissionState != .granted {
+            if accessMissing {
                 openPrivacySettings()
             }
         }
     }
 
-    @objc private func openPrivacySettings() {
+    private func openPrivacySettings() {
         openSystemSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
     }
 
@@ -513,7 +453,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// Starts a fresh copy through LaunchServices (so it is its own permission subject) and
     /// quits only once that launch has succeeded.
-    @objc private func relaunch() {
+    private func relaunch() {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.createsNewApplicationInstance = true
         let logger = self.logger
@@ -620,7 +560,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case .awaitingPermission:
             if !loggedMissingPermission {
                 loggedMissingPermission = true
-                logger.error("Music Sync is on but Screen & System Audio Recording access isn't granted; showing the steady glow")
+                logger.error("Music Sync is on but Screen & System Audio Recording access isn't granted; showing the idle flow")
             }
             stopAudioSync()
             watchPermission()
