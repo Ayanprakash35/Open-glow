@@ -54,8 +54,8 @@ counter-clockwise at roughly 1,700–2,800 pt/s in the fast flow style; music sw
 
 ## Rendering cost
 
-One frame of the edge light on a 1710 × 1112 pt display (about 96,000 cells in four strips),
-release build unless noted:
+One frame of the edge light on a 1710 × 1112 pt display (about 96,000 cells in strips along the
+edges), release build unless noted:
 
 | Version | Time per frame |
 |---|---|
@@ -64,8 +64,10 @@ release build unless noted:
 | Release build, packed-integer pixel loop | 0.15 ms |
 | Release build, only reachable cells, IOSurface output (≈39,000 cells) | 0.06 ms |
 
-Frame pacing: 60 fps while music is playing, 30 fps for the idle flow, nothing at all while the
-glow holds still or is hidden.
+Frame pacing: about 20 fps for the idle flow at Flow speed 1 (10–30 with the speed), 30 fps with
+music and 60 only while a swell changes fast (and during sweeps), a few frames a second for a timer
+ring alone, nothing at all while the glow holds still or is hidden. (The CPU rows below were
+measured under the earlier fixed pacing of 30 fps idle and 60 fps with music.)
 
 ## CPU in the running app
 
@@ -83,9 +85,15 @@ Phase 6 then cut both halves of the work:
 |---|---|---|
 | Rendering one frame (release) | 0.15 ms | 0.06 ms |
 | Audio analysis, CPU per second of music (release, best of 21 runs) | 2,243 µs | 543 µs |
-| Analysis timer wake-ups per second while music plays | ≈ 92 | ≈ 2.6 |
+| Analysis timer wake-ups per second while music plays | ≈ 92 | ≈ 10 (0.1.0), none (0.1.1)¹ |
 | Steady mode | — | 0% (nothing is drawn while the glow holds still) |
 | Coding-session check (every 1.5 s, ≈530 processes) | — | 0.03–0.04 ms |
+
+¹ While music plays, analysis runs once per audio delivery from ScreenCaptureKit (≈ 47 a second
+for 1024-frame deliveries). In 0.1.0 a 100 ms backup timer also fired throughout; in 0.1.1 every
+delivery pushes it back, so it only fires once deliveries stop. Measured with `proc_pid_rusage`
+over 5 s of real-time 1024-frame writes: 47.0 wake-ups a second with the writer alone and 47.0
+with the detector running too.
 
 ## Album colors
 

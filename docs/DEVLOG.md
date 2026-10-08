@@ -183,14 +183,15 @@ the top, over a new default palette of soft icy blue and lavender.
 
 - *No colors from Apple Music.* Music hands scripts no artwork for tracks streamed from Apple Music
   (confirmed by listening to Music's own broadcasts: no library file behind those tracks). For
-  those, Open Glow looks the cover up in Apple's public iTunes Search API, sending only artist,
-  album and title. Searching by album turned out unreliable; searching by song finds the right
-  track in both the Indian and US stores.
+  those, Open Glow looks the cover up in Apple's public iTunes Search API, sending the artist and
+  title (then the album) with the Mac's region code. Searching by album turned out unreliable;
+  searching by song finds the right track in both the Indian and US stores.
 - *A black-and-white cover fell back to the default colors.* Covers with no color now glow white
   and silver in the cover's own tint; pastel covers stay soft (the saturation floor dropped from
   50% to 30%).
 - *Colors seemed slow on some tracks.* The lookup now starts the moment a track starts, in parallel
-  with asking Music. Measured: new colors 170–470 ms after a track starts; a track heard before
+  with asking Music (since 0.1.1, only for streamed tracks — a local file waits for Music's own
+  artwork). Measured: new colors 170–470 ms after a track starts; a track heard before
   recolors instantly.
 
 ---
@@ -246,7 +247,7 @@ together:
   Core Animation as IOSurfaces with no copy — 0.06 ms per frame, down from 0.15 ms, with frames
   pixel-for-pixel within a few levels of before. The beat detector now runs whenever audio arrives
   instead of on a 10.7 ms timer, uses a fast selection instead of sorting for its medians, and keeps
-  its threshold history sorted: about 4× less CPU and 2.6 wake-ups a second instead of 92, with
-  bit-identical beats.
+  its threshold history sorted: about 4× less CPU and about 10 timer wake-ups a second (a 100 ms
+  watchdog) instead of 92, with bit-identical beats.
 
 **First release, v0.1.0** — published on GitHub with a downloadable app.

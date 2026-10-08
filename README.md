@@ -60,7 +60,12 @@ Different palettes — the soft default, a warm album, a cool album:
 
 ## Install
 
-There are no prebuilt releases yet; building takes about a minute.
+**Download:** grab `Open-Glow-<version>.dmg` (or the `.zip`) from the
+[latest release](https://github.com/Ayanprakash35/Open-glow/releases/latest), drag **Open Glow**
+to Applications, then see [Running a build you downloaded](#running-a-build-you-downloaded) — the
+app isn't notarized, so macOS needs one command before it will open it.
+
+**Build it yourself** (about a minute):
 
 ```bash
 git clone https://github.com/Ayanprakash35/Open-glow.git
@@ -80,25 +85,34 @@ macOS remembers privacy permissions per app *identity*. An ad-hoc signature's id
 the exact binary, so every rebuild would look like a new app and lose its permissions.
 `Scripts/setup_signing.sh` creates a local, self-signed **"Open Glow Dev"** code-signing identity
 once, in its own keychain (`~/Library/Keychains/openglow-signing.keychain-db`), and
-`Scripts/build_app.sh` signs with it automatically, so permissions survive rebuilds. To remove it:
+`Scripts/build_app.sh` signs with it automatically, so permissions survive rebuilds. The setup
+script is safe to run again: it says "Already set up" when everything works, and repairs a
+half-finished setup (it starts over, so macOS asks for Open Glow's permissions once more). To
+remove it:
 
 ```bash
 security delete-keychain ~/Library/Keychains/openglow-signing.keychain-db
 rm -r ~/Library/Application\ Support/Open\ Glow\ Dev\ Signing
 ```
 
-Without it, `build_app.sh` signs ad-hoc. You can also sign with any identity of your own:
-`OPENGLOW_SIGN_IDENTITY="My Identity" ./Scripts/build_app.sh`.
+Without it, `build_app.sh` signs ad-hoc. If the identity is there but can't be used, the build
+still finishes: it prints a warning and signs ad-hoc instead. You can also sign with any identity
+of your own, `OPENGLOW_SIGN_IDENTITY="My Identity" ./Scripts/build_app.sh`, or force ad-hoc with
+`OPENGLOW_SIGN_IDENTITY=-`.
 
 ### Running a build you downloaded
 
-A copy downloaded from elsewhere is quarantined and won't carry a signature your Mac trusts.
-Clear the quarantine flag and sign it ad-hoc:
+Release builds are signed ad-hoc and not notarized, so macOS quarantines the download and won't
+open it. Clear the quarantine flag (and, for a copy from anywhere else, re-sign it ad-hoc):
 
 ```bash
-xattr -dr com.apple.quarantine "Open Glow.app"
-codesign --force --deep --sign - "Open Glow.app"
+xattr -dr com.apple.quarantine "/Applications/Open Glow.app"
+codesign --force --deep --sign - "/Applications/Open Glow.app"   # only for copies from elsewhere
 ```
+
+An ad-hoc signature changes with every version, so after updating, macOS may ask for Screen &
+System Audio Recording again (if Music Sync stops reacting, see
+[Troubleshooting](#troubleshooting)).
 
 ## Permissions
 
@@ -113,14 +127,26 @@ through each one.
 
 There is no microphone permission — Open Glow never uses the microphone.
 
-**Network:** Apple Music doesn't hand artwork to other apps for streamed tracks, so for those
-Open Glow looks the cover up in Apple's public iTunes Search API, sending only the track's
-artist, album and title. Nothing else leaves your Mac.
+**Network.** Only album colors ever use the network, and only with Album Art as the color source
+and a player ticked under **From**. A player you untick is ignored completely — no Apple Events,
+no Automation prompt, no downloads.
+
+- **Apple Music, streamed tracks:** Music gives other apps no artwork for these, so Open Glow looks
+  the cover up in Apple's public iTunes Search API (`itunes.apple.com`, over https, no cookies):
+  the artist and title, then — only if that finds nothing — the artist and album, each with your
+  Mac's two-letter region code so the right store answers. The cover itself then comes from
+  Apple's image server.
+- **Apple Music, your own files:** their artwork comes from Music. A lookup happens only if Music
+  has no artwork for the track.
+- **Spotify:** the cover is downloaded from Spotify's image server (`i.scdn.co`), the address
+  Spotify itself reports. A lookup as above happens only if there's no usable cover.
+- Each track is looked up at most once, and not again while its colors are among the last 32
+  remembered. Nothing else leaves your Mac.
 
 ## Using Open Glow
 
-Open Glow lives in the menu bar. **Click** the icon for settings; **right-click** (or
-Control-click) for quick options, timers and Quit. The welcome tour opens on first launch; reopen
+Open Glow lives in the menu bar. **Click** the icon for everything — settings, the timer and coding
+sessions; **right-click** (or Control-click) for a quick menu of the same options and Quit. The welcome tour opens on first launch; reopen
 it from the right-click menu or the **?** in the settings popover.
 
 ### Animation
@@ -149,12 +175,16 @@ around the notch.
 
 ### Timers and Pomodoro
 
-Right-click the menu-bar icon › **Timer**: 5, 10, 15, 25 or 45 minutes, an hour, or a custom
-length — or **Start Pomodoro** (25-minute focus rounds with 5-minute breaks and a 15-minute break
-after every fourth round). While a timer runs, the whole edge starts lit and the light recedes
-clockwise from the top as time runs out; the countdown replaces the menu-bar icon; each phase
-ends with three soft pulses and a gentle chime. Pause, resume, skip a phase or cancel from the
-same menu. Time keeps counting while the Mac sleeps.
+Click the menu-bar icon › **Timer**: pick a **Countdown** — 5, 10, 15, 25 or 45 minutes, an hour,
+or **Custom…** (minutes, or h:mm like 1:30, up to 24 hours) — or **Start Pomodoro (25/5)**: four
+25-minute focus rounds with 5-minute breaks, then a 15-minute long break that ends the session.
+
+While a timer runs, the whole edge starts lit and the light recedes smoothly clockwise from the
+top as time runs out; the countdown replaces the menu-bar icon (with a warning triangle in front
+of it if Music Sync needs attention); each phase ends with three soft pulses and a gentle chime.
+The Timer section then shows the phase and time left with **Pause**/**Resume**, **Skip to
+Break**/**Skip Break** (**Finish Pomodoro** on the long break) and **Cancel Timer**. Time keeps
+counting while the Mac sleeps.
 
 ### Coding sessions
 
@@ -201,8 +231,9 @@ unit and a sensible range:
 
 | Constants | File | Controls |
 |---|---|---|
-| `GlowMotionConfig` | `GlowMotion.swift` | Flow speed, swell rise and fall, beat weight, opening sweep |
-| `GlowAccentConfig`, `TimerRingConfig` | `GlowAccent.swift`, `GlowTimerRing.swift` | Coding-session sweep; timer ring and finish pulses |
+| `GlowMotionConfig` | `GlowMotion.swift` | Flow speed, swell rise and fall, beat weight, stereo, opening and coding-session sweeps, frame rates |
+| `TimerRingConfig` | `GlowTimerRing.swift` | Timer ring and finish pulses |
+| `GlowFrameConfig` | `GlowRenderer.swift` | Display-link pacing, strip rebuilds while a slider moves |
 | `PomodoroConfig` | `GlowTimer.swift` | Focus, break and long-break lengths |
 | `CodingSessionConfig` | `CodingSessionMonitor.swift` | How often sessions are looked for, and each tool's colors |
 | `EdgeLightConfig` | `EdgeLightRasterizer.swift` | Falloff shape, tail, resolution |
@@ -224,9 +255,10 @@ unit and a sensible range:
   flowing field split between the palette's two colors, an idle drift of brighter and dimmer
   patches, and in Music Sync an envelope that turns beats into swells travelling outward along the
   edges.
-- **Rendering** — `EdgeLightRasterizer` turns that state into four strip images (top, bottom,
-  left, right) — light falling off smoothly from the edge — computed with integer math in the
-  display's own color space and handed to Core Animation as IOSurfaces (no per-frame copy);
+- **Rendering** — `EdgeLightRasterizer` turns that state into strip images along the edges (the
+  corners, the notch, the spans between them and the sides) — light falling off smoothly from the
+  edge — computed with integer math in the display's own color space and handed to Core Animation
+  as IOSurfaces (no per-frame copy);
   `GlowView` shows them scaled up smoothly in a click-through window above everything on each
   display. Nothing is drawn while the glow holds still or its window isn't visible.
 - **Colors** — `NowPlayingMonitor` follows Music and Spotify through their notifications and
@@ -241,6 +273,8 @@ Sources/OpenGlow/
   CaptureRecovery.swift         retries and recovery after capture stops
   Settings.swift                every preference, persisted
   SettingsView.swift            the popover
+  StatusMenu.swift              the right-click menu
+  StatusModel.swift             what the popover and icon say about Music Sync
   Onboarding*.swift             the welcome tour
   DisplayManager.swift          one overlay window per display
   OverlayWindowController.swift the click-through overlay window
@@ -256,14 +290,15 @@ Sources/OpenGlow/
   Median.swift                  fast medians for the onset thresholds
   ColorCoordinator.swift        which palette to show
   NowPlaying*.swift             Music and Spotify
-  ArtworkLookup.swift           covers for streamed tracks
+  ArtworkLookup.swift           covers from Apple's catalog
   ColorExtractor.swift          artwork → palette
   GlowPalette.swift             colors and presets
   CodingSession*.swift          Claude Code and Codex sessions
   ProcessTable.swift            reading the process list (libproc)
   GlowTimer.swift               timer and Pomodoro model
   TimerController.swift         the running timer
-  TimerMenu.swift               timer menu and menu-bar countdown
+  TimerMenu.swift               timer labels and the menu-bar countdown
+  TimerPanel.swift              the popover's Timer section
   TimerPresenter.swift          timer → ring, pulses and countdown
   LaunchAtLogin.swift           SMAppService
 ```
@@ -281,7 +316,9 @@ holds still (Steady mode) or is hidden, and analysis only runs while music plays
 | Checking for new coding sessions (every 1.5 s) | ≈ 0.04 ms |
 | Steady mode | 0% CPU |
 
-Frames run at 60 fps while music plays and 30 fps for the idle flow. The full numbers, and how
+Frames run at about 20 fps for the idle flow at the default Flow speed (10–30 with the speed), and
+at 30 fps with music — 60 only while a swell changes fast. While music plays, analysis runs once per
+audio delivery from the system (≈ 47 a second) with no extra timer wake-ups. The full numbers, and how
 they were measured, are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md); the story behind them is
 in [docs/DEVLOG.md](docs/DEVLOG.md).
 
