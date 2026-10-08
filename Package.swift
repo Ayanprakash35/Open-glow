@@ -3,6 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "OpenGlow",
+    // The app needs macOS 26 (LSMinimumSystemVersion in Resources/Info.plist); .v14 suits older CI SDKs.
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
