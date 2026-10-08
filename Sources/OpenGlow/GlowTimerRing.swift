@@ -10,14 +10,15 @@ enum TimerRingConfig {
     static let headLength: Double = 0.6
     /// Brightness of the used-up part of the edge, as a share of normal. Sane range: 0–0.15.
     static let spentLevel: Float = 0
-    /// Seconds the shown ring takes to catch up with a step down (time passing) and a step up (a
-    /// new or cancelled timer refilling it). The longer, the smoother between sparse updates.
-    /// Sane ranges: 0.5–3 and 0.2–1.
-    static let drainSeconds: Double = 1.2
+    /// Seconds the shown ring takes to make up a gap below where the timer is (a correction) and
+    /// above it (a new or cancelled timer refilling the ring). Time passing itself isn't eased:
+    /// the ring recedes at the timer's own steady pace between updates. Sane ranges: 0.3–2 and
+    /// 0.2–1.
+    static let drainSeconds: Double = 0.8
     static let refillSeconds: Double = 0.45
-    /// Points the boundary moves between redraws while only the ring changes: soft as it is, a
-    /// point between frames reads as smooth motion. Sane range: 0.25–3.
-    static let frameStepPoints: Double = 1
+    /// Points the boundary moves between redraws while only the ring changes: soft as it is, half
+    /// a point between frames reads as continuous motion. Sane range: 0.25–2.
+    static let frameStepPoints: Double = 0.5
     /// The ring counts as caught up within this many points of where it's heading. Sane range: 0.1–1.
     static let settlePoints: Double = 0.5
     /// Fastest the ring alone redraws, in frames per second. Sane range: 20–60.
@@ -38,14 +39,19 @@ enum TimerRingConfig {
 
 /// A visual timer on the edge light: only the remaining share of the perimeter is lit, measured
 /// clockwise from the top center, with soft ends and a slightly brighter head where it recedes.
-/// Colors and motion carry on inside the lit part. The shown ring eases toward each new value, so
-/// sparse updates (once a second) still move it smoothly; it starts full, and refills before it
-/// goes away. When a timer finishes, three slow pulses of the whole edge replace the ring.
+/// Colors and motion carry on inside the lit part. Each update says how fast the share is falling,
+/// so between sparse updates (once a second) the ring keeps receding at that steady pace instead
+/// of jumping or easing in spurts; any gap to the latest value is eased out. It starts full, and
+/// refills before it goes away. When a timer finishes, three slow pulses of the whole edge replace
+/// the ring.
 ///
 /// Positions are shares of the way around the screen, clockwise from the top-left corner.
 struct TimerRing {
-    /// The remaining share the timer reports; nil without a timer.
+    /// The remaining share the timer last reported; nil without a timer.
     private(set) var target: Double?
+    /// How fast that share falls, per second (0 while paused), and seconds since the report.
+    private var rate: Double = 0
+    private var sinceUpdate: Double = 0
     /// The remaining share on screen; nil when no ring shows.
     private(set) var shown: Double?
     /// Seconds into the finish pulses; nil when they're not playing.
@@ -57,9 +63,18 @@ struct TimerRing {
 
     static var finishSeconds: Double { 2.75 * TimerRingConfig.pulseSeconds }
 
-    mutating func set(_ fraction: Double?) {
+    /// `fraction` is the share left now; `rate` how much of it goes per second while it runs.
+    mutating func set(_ fraction: Double?, rate: Double = 0) {
         target = fraction.map { min(max($0, 0), 1) }
+        self.rate = target == nil ? 0 : max(rate, 0)
+        sinceUpdate = 0
         if target != nil, shown == nil { shown = 1 }
+    }
+
+    /// Where the timer is now: the last report, carried on at its pace. 1 without a timer.
+    private var goal: Double {
+        guard let target else { return 1 }
+        return max(target - rate * sinceUpdate, 0)
     }
 
     mutating func finish() {
@@ -71,16 +86,22 @@ struct TimerRing {
 
     /// Jumps to where the ring is heading, without easing — after time passed unseen.
     mutating func settle() {
-        shown = target
+        shown = target == nil ? nil : goal
     }
 
     mutating func advance(dt: Double, perimeter: Double) {
-        if var value = shown {
-            let goal = target ?? 1
-            let seconds = goal > value ? TimerRingConfig.refillSeconds : TimerRingConfig.drainSeconds
-            value += (goal - value) * (1 - exp(-dt / seconds))
-            if abs(goal - value) * perimeter < TimerRingConfig.settlePoints { value = goal }
-            shown = target == nil && value >= 1 ? nil : value
+        if let value = shown {
+            // Move with the timer, and ease out whatever gap is left on top of that.
+            let gap = value - goal
+            sinceUpdate += dt
+            let now = goal
+            let seconds = gap < 0 ? TimerRingConfig.refillSeconds : TimerRingConfig.drainSeconds
+            var next = now + gap * exp(-dt / seconds)
+            // Snap once caught up, so the ring can hold still — but not while it recedes, where
+            // the snap would be a small jump in an otherwise even pace.
+            let receding = target != nil && rate > 0 && now > 0
+            if !receding, abs(next - now) * perimeter < TimerRingConfig.settlePoints { next = now }
+            shown = target == nil && next >= 1 ? nil : min(max(next, 0), 1)
         }
         if let elapsed = finishElapsed {
             finishElapsed = elapsed + dt < Self.finishSeconds ? elapsed + dt : nil
@@ -89,18 +110,19 @@ struct TimerRing {
     }
 
     /// Frames per second the ring needs: just enough for the boundary to move about
-    /// `frameStepPoints` per frame; 0 once it has caught up.
+    /// `frameStepPoints` per frame; 0 once it holds still.
     func frameRate(perimeter: Double) -> Double {
-        var rate = finishElapsed != nil ? TimerRingConfig.pulseFrameRate : 0
+        var frames = finishElapsed != nil ? TimerRingConfig.pulseFrameRate : 0
         if let shown {
-            let goal = target ?? 1
+            let goal = goal
             let seconds = goal > shown ? TimerRingConfig.refillSeconds : TimerRingConfig.drainSeconds
-            let pointsPerSecond = abs(goal - shown) / seconds * perimeter
+            let moving = goal > 0 && target != nil ? rate : 0
+            let pointsPerSecond = (moving + abs(goal - shown) / seconds) * perimeter
             if pointsPerSecond > 0 {
-                rate = max(rate, min(max(pointsPerSecond / TimerRingConfig.frameStepPoints, 2), TimerRingConfig.maximumFrameRate))
+                frames = max(frames, min(max(pointsPerSecond / TimerRingConfig.frameStepPoints, 2), TimerRingConfig.maximumFrameRate))
             }
         }
-        return rate
+        return frames
     }
 
     /// Masks the computed cells to the ring and plays the finish pulses over them. `origin` is the

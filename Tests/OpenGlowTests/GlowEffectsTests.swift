@@ -163,11 +163,11 @@ struct GlowEffectsTests {
         let ringed = motion()
         // A 25-minute timer, updated once a second.
         let total = 25.0 * 60
-        ringed.setTimerRing(1)
+        ringed.setTimerRing(1, rate: 1 / total)
         var shown: [Double] = []
         var rates: [Double] = []
         for second in 1...20 {
-            ringed.setTimerRing(1 - Double(second) / total)
+            ringed.setTimerRing(1 - Double(second) / total, rate: 1 / total)
             for _ in 0..<Int(fps) {
                 ringed.step(dt: 1 / fps, audio: nil, settings: settings)
                 shown.append(ringed.shownTimerRing ?? 1)
@@ -175,11 +175,21 @@ struct GlowEffectsTests {
             }
         }
         let steps = zip(shown, shown.dropFirst()).map { ($0 - $1) * 5644 }
+        let even = 5644 / total / fps
         #expect(steps.allSatisfy { $0 >= 0 && $0 < 0.5 }, "moves a fraction of a point per frame, never back")
-        #expect(rates.suffix(Int(10 * fps)).allSatisfy { $0 > 0 && $0 <= 6 }, "a few frames a second, not 60")
-        #expect(abs((shown.last ?? 0) - (1 - 20 / total)) * 5644 < 3, "keeps up with the timer")
+        // The old easing moved in spurts: fast just after each update, nearly still before the next.
+        #expect(steps.suffix(Int(10 * fps)).allSatisfy { abs($0 - even) < 0.05 * even }, "an even pace, no spurts")
+        #expect(rates.suffix(Int(10 * fps)).allSatisfy { $0 > 0 && $0 <= 10 }, "a few frames a second, not 60")
+        // A second after the last update, carried on at the timer's pace.
+        #expect(abs((shown.last ?? 0) - (1 - 21 / total)) * 5644 < 0.5, "keeps up with the timer")
         // In Flow the ring rides along at the flow's own rate.
         #expect(ringed.frameRate(GlowMotionSettings(animation: .flow), audioActive: false) == GlowMotionConfig.flowFrameRate)
+
+        // Paused: it stops where the timer stopped and needs no frames.
+        ringed.setTimerRing(1 - 20.5 / total, rate: 0)
+        run([ringed], seconds: 5, settings: settings)
+        #expect(abs((ringed.shownTimerRing ?? 0) - (1 - 20.5 / total)) < 1e-9)
+        #expect(!ringed.needsFrames(settings, audioActive: false))
     }
 
     @Test func clearingTheRingRestoresTheNormalGlow() {

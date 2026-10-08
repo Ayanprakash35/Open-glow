@@ -121,8 +121,8 @@ final class OverlayWindowController: NSWindowController {
         glowView.playAccent(palette)
     }
 
-    func setTimerRing(remaining fraction: Double?) {
-        glowView.setTimerRing(remaining: fraction)
+    func setTimerRing(remaining fraction: Double?, rate: Double = 0) {
+        glowView.setTimerRing(remaining: fraction, rate: rate)
     }
 
     func playTimerFinished() {

@@ -283,9 +283,10 @@ final class GlowMotion {
         accent.start(palette)
     }
 
-    /// Shows a timer ring with `fraction` (0...1) of the perimeter lit; nil removes it.
-    func setTimerRing(_ fraction: Double?) {
-        ring.set(fraction)
+    /// Shows a timer ring with `fraction` (0...1) of the perimeter lit, falling by `rate` a second
+    /// until the next call; nil removes it.
+    func setTimerRing(_ fraction: Double?, rate: Double = 0) {
+        ring.set(fraction, rate: rate)
     }
 
     /// Plays the finish pulses and ends the ring.

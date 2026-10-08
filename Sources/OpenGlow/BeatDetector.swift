@@ -104,9 +104,9 @@ enum EnvelopeConfig {
     /// so a 50ms poll can't miss audio resuming. While music plays, each delivery of captured
     /// audio triggers a tick instead (see `BeatDetector`).
     static let idlePollInterval: TimeInterval = 0.05
-    /// Seconds between backup ticks while music plays. Ticks then follow audio deliveries, so
-    /// these only notice a stalled capture (`staleAudioTimeout`), at most this much late.
-    /// Sane range: 0.05–0.15.
+    /// While music plays, ticks follow audio deliveries and each one pushes a backup tick this
+    /// many seconds out, so the backup only fires once deliveries stop — to notice a stalled
+    /// capture (`staleAudioTimeout`), at most this much late. Sane range: 0.05–0.15.
     static let deliveryWatchdogInterval: TimeInterval = 0.1
 }
 
@@ -559,6 +559,9 @@ final class BeatDetector: @unchecked Sendable {
     private func tick() {
         process(now: ProcessInfo.processInfo.systemUptime)
         setFollowsDeliveries(hasAudio && !isStale && !wasSilent)
+        // Push the watchdog back: while deliveries keep coming it never fires, saving ~10 timer
+        // wake-ups a second.
+        if followsDeliveries, let timer { Self.schedule(timer, followingDeliveries: true) }
     }
 
     /// Switches between ticking on each audio delivery (with a slow watchdog timer) and polling.

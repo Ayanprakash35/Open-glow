@@ -156,11 +156,12 @@ final class GlowView: NSView {
     }
 
     /// Shows a visual timer: only `fraction` of the perimeter stays lit, clockwise from the top
-    /// center (1 = the whole edge, 0 = none), receding smoothly between updates — calling once a
-    /// second is plenty. nil removes the ring (it refills, then the normal glow carries on); pass
-    /// nil when the timer is cancelled or done.
-    func setTimerRing(remaining fraction: Double?) {
-        motion.setTimerRing(fraction)
+    /// center (1 = the whole edge, 0 = none). `rate` is how much of the share goes per second
+    /// while the timer runs (0 while paused): the ring keeps receding at that pace between
+    /// updates, so calling once a second is plenty. nil removes the ring (it refills, then the
+    /// normal glow carries on); pass nil when the timer is cancelled or done.
+    func setTimerRing(remaining fraction: Double?, rate: Double = 0) {
+        motion.setTimerRing(fraction, rate: rate)
         if !isOnScreen { motion.settleTimerRing() }
         updateLink()
     }

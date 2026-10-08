@@ -39,6 +39,7 @@ final class DisplayManager {
 
     /// Called after the set of displays changes (connect, disconnect, reconfiguration).
     private var timerFraction: Double?
+    private var timerRate: Double = 0
 
     var onDisplaysChanged: (() -> Void)?
 
@@ -123,10 +124,12 @@ final class DisplayManager {
     }
 
     /// A running timer's remaining share (1 → 0) as a ring of light on every display, and on
-    /// displays connected later; nil when no timer runs.
-    func setTimerRing(remaining fraction: Double?) {
+    /// displays connected later; nil when no timer runs. `rate` is the share that goes per second
+    /// while it runs (0 while paused), so the ring recedes smoothly between calls.
+    func setTimerRing(remaining fraction: Double?, rate: Double = 0) {
         timerFraction = fraction
-        controllers.values.forEach { $0.setTimerRing(remaining: fraction) }
+        timerRate = rate
+        controllers.values.forEach { $0.setTimerRing(remaining: fraction, rate: rate) }
     }
 
     /// The finish pulses at the end of a timer or Pomodoro phase, on every visible display.
@@ -194,7 +197,7 @@ final class DisplayManager {
                 let controller = OverlayWindowController(screen: screen, displayUUID: uuid)
                 applyBaseAppearance(to: controller)
                 controller.setPalette(palette, animated: false)
-                controller.setTimerRing(remaining: timerFraction)
+                controller.setTimerRing(remaining: timerFraction, rate: timerRate)
                 if let frameSource { controller.startAudioFrames(source: frameSource) }
                 controllers[uuid] = controller
             }
