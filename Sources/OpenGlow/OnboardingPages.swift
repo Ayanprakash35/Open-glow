@@ -6,18 +6,13 @@ enum OnboardingPalettes {
     static let demo: [GlowPalette] = ["dusk", "lagoon", "ember", "aurora"].map {
         PalettePresets.preset(withID: $0).palette
     }
-    /// Claude Code's warm orange, as the coding-session glow shows it.
-    static let claude = GlowPalette(
-        primary: PaletteColor(red: 0.85, green: 0.47, blue: 0.34),
-        secondary: PaletteColor(red: 0.98, green: 0.72, blue: 0.52),
-        balance: 0.6
-    )
-    /// Codex's colors, as the coding-session glow shows them.
-    static let codex = GlowPalette(
-        primary: PaletteColor(red: 0.36, green: 0.52, blue: 1.00),
-        secondary: PaletteColor(red: 0.66, green: 0.46, blue: 1.00),
-        balance: 0.55
-    )
+
+    /// A tool's colors, the very ones its coding-session sweep shows, muted while that tool's
+    /// glow is off.
+    @MainActor
+    static func codingSession(_ tool: CodingSessionMonitor.Tool, in settings: Settings) -> GlowPalette {
+        settings.glowsForCodingSession(tool) ? tool.palette : muted(tool.palette)
+    }
 
     /// `palette` drained of most of its color, for a feature that's switched off. Done to the
     /// colors rather than with a saturation filter, so snapshots show it too.
@@ -86,7 +81,7 @@ struct OnboardingPageView: View {
         case .lookAndMotion:
             "Choose how the light moves and how bright it is. Your screen changes as you go."
         case .codingSessions:
-            "Open Glow can greet a new Claude Code or Codex session with a wave of light around your screen — Claude's warm orange, or Codex's own colors."
+            "Open Glow can greet a new Claude Code or Codex session with a wave of light around your screen — Claude's warm orange, or Codex's cool indigo."
         case .allSet:
             "Open Glow lives in your menu bar. Here's where to find everything."
         }
@@ -122,9 +117,8 @@ struct OnboardingPageView: View {
                 DesktopWindow()
             }
         case .codingSessions:
-            let palettes = [OnboardingPalettes.claude, OnboardingPalettes.codex]
             EdgeGlowIllustration(
-                palettes: settings.codingSessionGlow ? palettes : palettes.map(OnboardingPalettes.muted),
+                palettes: CodingSessionMonitor.Tool.allCases.map { OnboardingPalettes.codingSession($0, in: settings) },
                 motion: .flow
             ) { _ in
                 TerminalWindow()
