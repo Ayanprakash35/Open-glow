@@ -15,9 +15,15 @@ enum ArtworkLookupConfig {
 }
 
 /// Finds a track's album cover through Apple's public iTunes Search API, for when the player won't
-/// hand it over: Music.app gives scripts no artwork for streamed Apple Music tracks, only for
-/// tracks stored in the library. Only the artist, album and title leave the Mac; nothing is sent
-/// for a track whose artwork the player provided.
+/// hand it over: Music gives scripts no artwork for streamed Apple Music tracks, and Spotify has
+/// none for its local files. `ColorCoordinator` decides when it's asked.
+///
+/// What a lookup sends, over https with no cookies, to itunes.apple.com: a song search for
+/// "artist title", then — only if that finds no confident match — an album search for
+/// "artist album". Each search also carries the Mac's region as a two-letter country code, so
+/// the user's own store is searched; it's left out when the region isn't one, and dropped for
+/// the rest of the lookup if the store rejects it. The matching cover is then downloaded from the
+/// address the store gave, on Apple's image server. Nothing else is sent.
 enum ArtworkLookup {
     private static let logger = Logger(subsystem: "com.openglow.app", category: "ArtworkLookup")
 
@@ -25,14 +31,19 @@ enum ArtworkLookup {
     /// artist plus title finds the track reliably and its result carries the album cover — then
     /// by album, which the store matches less reliably.
     static func artwork(artist: String, album: String, title: String) async -> Data? {
-        guard !artist.isEmpty, !(album.isEmpty && title.isEmpty) else { return nil }
         let session = URLSession(configuration: .ephemeral)
         defer { session.finishTasksAndInvalidate() }
+        let country = storeCountry(forRegion: Locale.current.region?.identifier)
+        return await artwork(artist: artist, album: album, title: title, country: country, session: session)
+    }
+
+    /// `artwork(artist:album:title:)` with the store region and session given (internal for tests).
+    static func artwork(artist: String, album: String, title: String, country: String?, session: URLSession) async -> Data? {
+        guard !artist.isEmpty, !(album.isEmpty && title.isEmpty) else { return nil }
+        var country = country
         var searched = 0
         for search in searches(artist: artist, album: album, title: title) {
-            guard let url = searchURL(term: search.term, entity: search.entity),
-                  let results = await results(from: url, session: session)
-            else { continue }
+            guard let results = await results(of: search, country: &country, session: session) else { continue }
             searched += results.count
             if let match = bestMatch(in: results, artist: artist, album: album, title: title),
                let coverURL = coverURL(from: match),
@@ -44,16 +55,47 @@ enum ArtworkLookup {
         return nil
     }
 
-    private static func results(from url: URL, session: URLSession) async -> [SearchResult]? {
+    /// Runs one search. If the store rejects the country (HTTP 400: a region without an iTunes
+    /// storefront), searches once more without it, and leaves it out of later searches too.
+    private static func results(of search: Search, country: inout String?, session: URLSession) async -> [SearchResult]? {
+        guard let url = searchURL(term: search.term, entity: search.entity, country: country) else { return nil }
+        switch await results(from: url, session: session) {
+        case .found(let results):
+            return results
+        case .rejected(status: 400) where country != nil:
+            let rejected = country ?? ""
+            logger.notice("The store rejected country \(rejected, privacy: .public); searching its default store instead")
+            country = nil
+            guard let url = searchURL(term: search.term, entity: search.entity, country: nil),
+                  case .found(let results) = await results(from: url, session: session)
+            else { return nil }
+            return results
+        case .rejected, .failed:
+            return nil
+        }
+    }
+
+    private enum SearchOutcome {
+        case found([SearchResult])
+        /// The store answered with this HTTP status instead of results.
+        case rejected(status: Int)
+        case failed
+    }
+
+    private static func results(from url: URL, session: URLSession) async -> SearchOutcome {
         do {
             var request = URLRequest(url: url, timeoutInterval: ArtworkLookupConfig.timeout)
             request.httpShouldHandleCookies = false
             let (data, response) = try await session.data(for: request)
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-            return try JSONDecoder().decode(SearchResponse.self, from: data).results
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == 200 else {
+                logger.notice("Artwork search answered HTTP \(status, privacy: .public)")
+                return .rejected(status: status)
+            }
+            return .found(try JSONDecoder().decode(SearchResponse.self, from: data).results)
         } catch {
             logger.notice("Artwork search failed: \(error.localizedDescription, privacy: .public)")
-            return nil
+            return .failed
         }
     }
 
@@ -98,24 +140,38 @@ enum ArtworkLookup {
         return searches
     }
 
-    static func searchURL(term: String, entity: String) -> URL? {
+    /// The store to search for a Mac region identifier: the region itself when it's a two-letter
+    /// country code, else nil (the store's default, US). The store answers HTTP 400 to anything
+    /// else, such as the UN M.49 areas "419" (Latin America) or "150" (Europe) that some
+    /// locales carry.
+    static func storeCountry(forRegion region: String?) -> String? {
+        guard let scalars = region?.unicodeScalars, scalars.count == 2,
+              scalars.allSatisfy({ $0.isASCII && CharacterSet.letters.contains($0) })
+        else { return nil }
+        return region?.uppercased()
+    }
+
+    /// `country` nil leaves the parameter out.
+    static func searchURL(term: String, entity: String, country: String?) -> URL? {
         var components = URLComponents(string: "https://itunes.apple.com/search")
-        components?.queryItems = [
+        var items = [
             URLQueryItem(name: "term", value: term),
             URLQueryItem(name: "media", value: "music"),
             URLQueryItem(name: "entity", value: entity),
             URLQueryItem(name: "limit", value: String(ArtworkLookupConfig.resultLimit)),
-            // The user's own store, so regional releases are found.
-            URLQueryItem(name: "country", value: Locale.current.region?.identifier ?? "US"),
         ]
+        // The user's own store, so regional releases are found.
+        if let country { items.append(URLQueryItem(name: "country", value: country)) }
+        components?.queryItems = items
         return components?.url
     }
 
     /// The result by the same artist that best matches the title and album. The artist must
     /// match, and so must the title or the album: a wrong cover would color the glow for the
-    /// wrong song.
+    /// wrong song. Among equally good matches — editions whose qualifiers `normalized` drops,
+    /// such as "(Deluxe Edition)" or "(Taylor's Version)" — the one spelled most exactly like the
+    /// player's title and album wins, and only then the store's order.
     static func bestMatch(in results: [SearchResult], artist: String, album: String, title: String) -> SearchResult? {
-        let wantedArtist = normalized(artist)
         let wantedTitle = normalized(title)
         let wantedAlbum = normalized(album)
         func similarity(_ found: String?, _ wanted: String) -> Int {
@@ -124,13 +180,39 @@ enum ArtworkLookup {
             if found == wanted { return 2 }
             return found.contains(wanted) || wanted.contains(found) ? 1 : 0
         }
-        var best: (result: SearchResult, score: Int)?
-        for result in results {
-            guard similarity(result.artistName, wantedArtist) > 0 else { continue }
+        func exactness(_ found: String?, _ wanted: String) -> Int {
+            let wanted = folded(wanted)
+            return !wanted.isEmpty && folded(found ?? "") == wanted ? 1 : 0
+        }
+        var best: (result: SearchResult, score: Int, exactness: Int)?
+        for result in results where isSameArtist(result.artistName ?? "", artist) {
             let score = 2 * similarity(result.trackName, wantedTitle) + similarity(result.collectionName, wantedAlbum)
-            if score > 0, score > (best?.score ?? 0) { best = (result, score) }
+            guard score > 0 else { continue }
+            let exact = exactness(result.trackName, title) + exactness(result.collectionName, album)
+            if let best, (score, exact) <= (best.score, best.exactness) { continue }
+            best = (result, score, exact)
         }
         return best?.result
+    }
+
+    /// Whether two artist credits name the same artist: equal once normalized, or one is a run of
+    /// whole words in the other ("Bon Iver" in "Bon Iver & Vince Staples", "Weeknd" in "The
+    /// Weeknd") — never part of a word, so "X" doesn't match "Alex Turner".
+    static func isSameArtist(_ found: String, _ wanted: String) -> Bool {
+        let (a, b) = (normalized(found), normalized(wanted))
+        guard !a.isEmpty, !b.isEmpty else { return false }
+        if a == b { return true }
+        let (foundWords, wantedWords) = (words(found), words(wanted))
+        return containsRun(foundWords, in: wantedWords) || containsRun(wantedWords, in: foundWords)
+    }
+
+    private static func words(_ text: String) -> [String] {
+        text.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init)
+    }
+
+    private static func containsRun(_ run: [String], in words: [String]) -> Bool {
+        guard !run.isEmpty, run.count <= words.count else { return false }
+        return (0...(words.count - run.count)).contains { Array(words[$0..<$0 + run.count]) == run }
     }
 
     /// The cover at `imageSize`, from the result's 100×100 thumbnail address. https only.
@@ -155,6 +237,12 @@ enum ArtworkLookup {
         for suffix in [" - single", " - ep"] where value.hasSuffix(suffix) {
             value.removeLast(suffix.count)
         }
-        return String(value.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
+        return folded(value)
+    }
+
+    /// Lowercased letters and digits only, qualifiers kept: compares spellings that differ only
+    /// in case, spacing or punctuation (’ for ') as equal, but tells editions apart.
+    static func folded(_ text: String) -> String {
+        String(text.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
     }
 }
