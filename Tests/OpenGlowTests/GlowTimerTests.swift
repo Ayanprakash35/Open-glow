@@ -17,6 +17,7 @@ struct CountdownTests {
         let start = try #require(timer.snapshot(at: instant(0)))
         #expect(start.kind == .countdown && start.remaining == 300 && start.remainingFraction == 1)
         #expect(start.displaySeconds == 300 && start.round == nil && start.rounds == nil && !start.isPaused)
+        #expect(start.isLastPhase)
         // The display rounds up: 5:00 for the first second, 4:59 once a full second has gone.
         #expect(timer.snapshot(at: instant(0.4))?.displaySeconds == 300)
         #expect(timer.snapshot(at: instant(1))?.displaySeconds == 299)
@@ -115,6 +116,25 @@ struct PomodoroTests {
         let ended = timer.advance(to: instant(10 + 2 + 10 + 5))
         #expect(ended.map(\.kind) == [.focus, .shortBreak, .focus, .longBreak])
         #expect(!timer.isOver && timer.phase.kind == .focus && timer.phase.round == 1)
+    }
+
+    @Test func onlyTheLongBreakIsTheLastPhase() throws {
+        let timer = GlowTimer.pomodoro(startingAt: instant(0))
+        // Focus 1, its short break, and focus 4 are not last; the long break that ends the set is.
+        for minutes in [1.0, 26, 106] {
+            #expect(timer.snapshot(at: instant(minutes * minute))?.isLastPhase == false)
+        }
+        let longBreak = try #require(timer.snapshot(at: instant(121 * minute)))
+        #expect(longBreak.kind == .longBreak && longBreak.isLastPhase)
+        #expect(timer.snapshot(ofEnded: TimerPhase(kind: .longBreak, duration: 15 * minute, round: 4)).isLastPhase)
+        #expect(!timer.snapshot(ofEnded: TimerPhase(kind: .focus, duration: 25 * minute, round: 4)).isLastPhase)
+    }
+
+    @Test func aRepeatingPlanHasNoLastPhase() throws {
+        let plan = PomodoroPlan(focus: 10, shortBreak: 2, longBreak: 5, roundsPerSet: 1, repeats: true)
+        let timer = GlowTimer.pomodoro(plan, startingAt: instant(0))
+        let longBreak = try #require(timer.snapshot(at: instant(11)))
+        #expect(longBreak.kind == .longBreak && !longBreak.isLastPhase)
     }
 
     @Test func skipStartsTheNextPhaseInFull() {
@@ -246,7 +266,7 @@ struct TimerControllerTests {
         clock.seconds = 600
         controller.togglePause()
         #expect(updates.last??.isPaused == false && updates.last??.remaining == 24 * minute)
-        controller.skipPhase()
+        controller.skipPhase(expecting: .focus, round: 1)
         #expect(updates.last??.kind == .shortBreak && updates.last??.remaining == 5 * minute)
         controller.cancel()
         #expect(updates.last! == nil && controller.snapshot == nil)
@@ -278,6 +298,46 @@ struct TimerControllerTests {
         #expect(controller.snapshot?.kind == .shortBreak && controller.snapshot?.isPaused == true)
     }
 
+    @Test func aSkipRacingThePhaseEndKeepsTheBreak() throws {
+        // The menu was built with focus 1 a second from its end; the click lands just after it.
+        var finished: [TimerSnapshot] = []
+        let controller = makeController()
+        controller.onPhaseFinished = { finished.append($0) }
+        controller.startPomodoro()
+        clock.seconds = 25 * minute - 1
+        let shown = try #require(controller.snapshot)
+        clock.seconds = 25 * minute + 0.5
+        controller.skipPhase(expecting: shown.kind, round: shown.round)
+        #expect(finished.map(\.kind) == [.focus])
+        let now = try #require(controller.snapshot)
+        #expect(now.kind == .shortBreak && now.round == 1 && now.remaining == 5 * minute - 0.5)
+    }
+
+    @Test func skippingTheShownPhaseStillWorksMidPhase() throws {
+        let controller = makeController()
+        controller.startPomodoro()
+        clock.seconds = 28 * minute  // In the short break after round 1.
+        controller.skipPhase(expecting: .focus, round: 1)  // Stale: nothing happens.
+        #expect(controller.snapshot?.kind == .shortBreak)
+        controller.skipPhase(expecting: .shortBreak, round: 2)  // Wrong round: nothing either.
+        #expect(controller.snapshot?.kind == .shortBreak)
+        controller.skipPhase(expecting: .shortBreak, round: 1)
+        let focus = try #require(controller.snapshot)
+        #expect(focus.kind == .focus && focus.round == 2 && focus.remaining == 25 * minute)
+    }
+
+    @Test func finishingThePomodoroOnItsLastPhaseEndsIt() {
+        var updates: [TimerSnapshot?] = []
+        let controller = makeController()
+        controller.onUpdate = { updates.append($0) }
+        controller.startPomodoro()
+        clock.seconds = 121 * minute
+        controller.tick()
+        #expect(updates.last??.kind == .longBreak && updates.last??.isLastPhase == true)
+        controller.skipPhase(expecting: .longBreak, round: 4)
+        #expect(updates.last! == nil && controller.snapshot == nil)
+    }
+
     @Test func startingAgainReplacesTheTimer() {
         let controller = makeController()
         controller.startPomodoro()
@@ -296,18 +356,26 @@ struct TimerMenuTests {
     private func actions(_ log: Log, customMinutes: Int? = 20) -> TimerMenu.Actions {
         TimerMenu.Actions(
             startCountdown: { log.calls.append("countdown \(Int($0))") },
-            startPomodoro: { log.calls.append("pomodoro") },
+            startPomodoro: { log.calls.append("pomodoro \(Int($0.focus / 60))/\(Int($0.shortBreak / 60))") },
             pause: { log.calls.append("pause") },
             resume: { log.calls.append("resume") },
-            skipPhase: { log.calls.append("skip") },
+            skipPhase: { log.calls.append("skip \($0) \($1.map(String.init) ?? "-")") },
             cancel: { log.calls.append("cancel") },
             askForCustomMinutes: { customMinutes }
         )
     }
 
-    private func snapshot(_ kind: TimerKind, remaining: TimeInterval = 299, paused: Bool = false) -> TimerSnapshot {
+    private func snapshot(_ kind: TimerKind, remaining: TimeInterval = 299, paused: Bool = false, round: Int = 2) -> TimerSnapshot {
         let pomodoro = kind != .countdown
-        return TimerSnapshot(kind: kind, remaining: remaining, duration: 300, round: pomodoro ? 2 : nil, rounds: pomodoro ? 4 : nil, isPaused: paused)
+        return TimerSnapshot(
+            kind: kind,
+            remaining: remaining,
+            duration: 300,
+            round: pomodoro ? round : nil,
+            rounds: pomodoro ? 4 : nil,
+            isPaused: paused,
+            isLastPhase: kind == .countdown || kind == .longBreak
+        )
     }
 
     private func titles(_ item: NSMenuItem) -> [String] {
@@ -325,7 +393,17 @@ struct TimerMenuTests {
         menu.performActionForItem(at: 5)
         menu.performActionForItem(at: 6)
         menu.performActionForItem(at: 8)
-        #expect(log.calls == ["countdown 300", "countdown 3600", "countdown 1200", "pomodoro"])
+        #expect(log.calls == ["countdown 300", "countdown 3600", "countdown 1200", "pomodoro 25/5"])
+    }
+
+    @Test func pomodoroItemStartsThePlanItNames() throws {
+        _ = NSApplication.shared
+        let log = Log()
+        let plan = PomodoroPlan(focus: 50 * minute, shortBreak: 10 * minute, longBreak: 30 * minute, roundsPerSet: 3, repeats: false)
+        let item = TimerMenu.makeItem(for: nil, plan: plan, actions: actions(log))
+        #expect(titles(item).last == "Start Pomodoro (50/10)")
+        try #require(item.submenu).performActionForItem(at: 8)
+        #expect(log.calls == ["pomodoro 50/10"])
     }
 
     @Test func cancellingCustomStartsNothing() throws {
@@ -358,7 +436,33 @@ struct TimerMenuTests {
         let menu = try #require(paused.submenu)
         menu.performActionForItem(at: 2)
         menu.performActionForItem(at: 3)
-        #expect(log.calls == ["resume", "skip"])
+        // The skip item carries the phase it was built for.
+        #expect(log.calls == ["resume", "skip shortBreak 2"])
+    }
+
+    @Test func theLastPhaseOffersFinishPomodoro() throws {
+        _ = NSApplication.shared
+        let log = Log()
+        let item = TimerMenu.makeItem(for: snapshot(.longBreak, round: 4), actions: actions(log))
+        #expect(titles(item) == ["Long Break — 4:59 left", "—", "Pause", "Finish Pomodoro", "Cancel Timer"])
+        try #require(item.submenu).performActionForItem(at: 3)
+        #expect(log.calls == ["skip longBreak 4"])
+        #expect(TimerMenu.skipTitle(for: snapshot(.countdown)) == nil)
+        #expect(TimerMenu.skipTitle(for: snapshot(.focus)) == "Skip to Break")
+        #expect(TimerMenu.skipTitle(for: snapshot(.shortBreak)) == "Skip Break")
+    }
+
+    @Test func aSkipItemLeftOpenPastThePhaseEndKeepsTheBreak() throws {
+        _ = NSApplication.shared
+        let clock = TestClock()
+        let controller = TimerController(clock: { clock.now }, playSound: {})
+        controller.startPomodoro()
+        clock.seconds = 25 * minute - 3
+        let item = TimerMenu.makeItem(for: controller.snapshot, actions: TimerMenu.Actions(controller: controller))
+        #expect(titles(item)[3] == "Skip to Break")
+        clock.seconds = 25 * minute + 0.5  // The menu is still open as focus 1 runs out.
+        try #require(item.submenu).performActionForItem(at: 3)
+        #expect(controller.snapshot?.kind == .shortBreak && controller.snapshot?.round == 1)
     }
 
     @Test func presetTitles() {
@@ -390,6 +494,24 @@ struct TimerMenuTests {
             #expect(TimerMenu.statusImage(for: snapshot(kind, paused: true)) != nil)
         }
         #expect(TimerMenu.statusDescription(for: snapshot(.focus)) == "Open Glow — Focus 2 of 4 — 4:59 left")
+    }
+
+    @Test func attentionTakesTheGlyphAndJoinsTheTooltip() {
+        let warning = TimerAttention(symbol: "exclamationmark.triangle", description: "Open Glow can't capture audio for Music Sync")
+        #expect(TimerMenu.statusDescription(for: snapshot(.focus), attention: warning)
+            == "Open Glow — Focus 2 of 4 — 4:59 left\nOpen Glow can't capture audio for Music Sync")
+        #expect(TimerMenu.statusImage(for: snapshot(.focus, paused: true), attention: warning) != nil)
+        // The glyph comes from the attention's symbol, not the phase's: an unknown one draws nothing.
+        let unknown = TimerAttention(symbol: "no.such.symbol", description: "x")
+        #expect(TimerMenu.statusImage(for: snapshot(.focus), attention: unknown) == nil)
+
+        let button = NSButton(title: "", target: nil, action: nil)
+        TimerMenu.showCountdown(snapshot(.focus), attention: warning, on: button)
+        #expect(button.title == "4:59" && button.image != nil)
+        #expect(button.toolTip == TimerMenu.statusDescription(for: snapshot(.focus), attention: warning))
+        #expect(button.image?.accessibilityDescription == button.toolTip)
+        TimerMenu.showCountdown(snapshot(.focus), on: button)
+        #expect(button.toolTip == "Open Glow — Focus 2 of 4 — 4:59 left")
     }
 
     @Test func countdownReplacesAndRestoresTheButton() {

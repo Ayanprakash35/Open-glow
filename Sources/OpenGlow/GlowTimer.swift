@@ -143,6 +143,9 @@ struct TimerSnapshot: Equatable, Sendable {
     var round: Int?
     var rounds: Int?
     var isPaused: Bool
+    /// True when the timer ends with this phase, run out or skipped: always for a countdown; for
+    /// a Pomodoro, the long break unless the plan repeats.
+    var isLastPhase: Bool
 
     /// Share of the phase still to go: 1 at the start, 0 at the end.
     var remainingFraction: Double {
@@ -237,13 +240,22 @@ struct GlowTimer: Equatable, Sendable {
             duration: current.phase.duration,
             round: current.phase.round,
             rounds: rounds,
-            isPaused: current.isPaused
+            isPaused: current.isPaused,
+            isLastPhase: nextPhase(after: current.phase) == nil
         )
     }
 
     /// How a phase that just ended reads: nothing left.
     func snapshot(ofEnded phase: TimerPhase) -> TimerSnapshot {
-        TimerSnapshot(kind: phase.kind, remaining: 0, duration: phase.duration, round: phase.round, rounds: rounds, isPaused: false)
+        TimerSnapshot(
+            kind: phase.kind,
+            remaining: 0,
+            duration: phase.duration,
+            round: phase.round,
+            rounds: rounds,
+            isPaused: false,
+            isLastPhase: nextPhase(after: phase) == nil
+        )
     }
 
     /// Seconds from `now` until the displayed second changes or the phase ends, whichever is
@@ -301,13 +313,16 @@ struct GlowTimer: Equatable, Sendable {
         bankedElapsed = 0
     }
 
-    private mutating func enterPhase(after ended: TimerPhase, carrying overshoot: TimeInterval, at now: TimerInstant) {
-        let next: TimerPhase?
+    /// The phase that follows `phase` in this timer's program, or nil when the timer ends with it.
+    private func nextPhase(after phase: TimerPhase) -> TimerPhase? {
         switch program {
-        case .countdown: next = nil
-        case .pomodoro(let plan): next = plan.phase(after: ended)
+        case .countdown: nil
+        case .pomodoro(let plan): plan.phase(after: phase)
         }
-        guard let next else {
+    }
+
+    private mutating func enterPhase(after ended: TimerPhase, carrying overshoot: TimeInterval, at now: TimerInstant) {
+        guard let next = nextPhase(after: ended) else {
             cancel()
             return
         }
