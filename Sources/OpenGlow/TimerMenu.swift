@@ -13,17 +13,29 @@ enum TimerMenuConfig {
     static let pausedSymbol = "pause.fill"
 }
 
-/// Builds the Timer submenu and the menu-bar countdown. Menu items call the closures in
-/// `Actions`, so the owner of the status item only has to hook them up.
+/// A problem the menu-bar icon would warn about if the countdown weren't standing in for it.
+struct TimerAttention: Equatable {
+    /// SF Symbol shown before the countdown in place of the timer glyph.
+    var symbol: String
+    /// What's wrong, added to the countdown's tooltip and VoiceOver text.
+    var description: String
+}
+
+/// Builds the Timer submenu and the menu-bar countdown, and the titles the popover's Timer
+/// section shares with them. Menu items call the closures in `Actions`, so the owner of the
+/// status item only has to hook them up.
 @MainActor
 enum TimerMenu {
+    /// What the Timer submenu's items and the popover's Timer section call.
     @MainActor
     struct Actions {
         var startCountdown: (TimeInterval) -> Void
-        var startPomodoro: () -> Void
+        var startPomodoro: (PomodoroPlan) -> Void
         var pause: () -> Void
         var resume: () -> Void
-        var skipPhase: () -> Void
+        /// Skips the phase of this kind and round if it's still the current one, and does nothing
+        /// otherwise; see `TimerController.skipPhase(expecting:round:)`.
+        var skipPhase: (_ expecting: TimerKind, _ round: Int?) -> Void
         var cancel: () -> Void
         /// Asks for a custom length in minutes; nil when the user cancels.
         var askForCustomMinutes: () -> Int? = { TimerMenu.promptForCustomMinutes() }
@@ -48,17 +60,11 @@ enum TimerMenu {
 
     private static func addIdleItems(to menu: NSMenu, plan: PomodoroPlan, actions: Actions) {
         for minutes in TimerMenuConfig.presetMinutes {
-            menu.addItem(actionItem(presetTitle(minutes: minutes)) { actions.startCountdown(TimeInterval(minutes) * 60) })
+            menu.addItem(actionItem(presetTitle(minutes: minutes)) { actions.startCountdown(minutes: minutes) })
         }
-        menu.addItem(actionItem("Custom…") {
-            if let minutes = actions.askForCustomMinutes() {
-                actions.startCountdown(TimeInterval(minutes) * 60)
-            }
-        })
+        menu.addItem(actionItem("Custom…", action: actions.startCustomCountdown))
         menu.addItem(.separator())
-        let focus = Int((plan.focus / 60).rounded())
-        let pause = Int((plan.shortBreak / 60).rounded())
-        menu.addItem(actionItem("Start Pomodoro (\(focus)/\(pause))", action: actions.startPomodoro))
+        menu.addItem(actionItem(pomodoroTitle(for: plan)) { actions.startPomodoro(plan) })
     }
 
     private static func addRunningItems(for snapshot: TimerSnapshot, to menu: NSMenu, actions: Actions) {
@@ -67,10 +73,28 @@ enum TimerMenu {
         menu.addItem(header)
         menu.addItem(.separator())
         menu.addItem(snapshot.isPaused ? actionItem("Resume", action: actions.resume) : actionItem("Pause", action: actions.pause))
-        if snapshot.kind != .countdown {
-            menu.addItem(actionItem(snapshot.kind == .focus ? "Skip to Break" : "Skip Break", action: actions.skipPhase))
+        if let skipTitle = skipTitle(for: snapshot) {
+            // The menu stays open while the timer ticks, so the item names the phase it was built
+            // for: if that phase runs out before the click, the one after it isn't skipped instead.
+            menu.addItem(actionItem(skipTitle) { actions.skipPhase(snapshot.kind, snapshot.round) })
         }
         menu.addItem(actionItem("Cancel Timer", action: actions.cancel))
+    }
+
+    /// "Start Pomodoro (25/5)": focus and short-break minutes.
+    static func pomodoroTitle(for plan: PomodoroPlan) -> String {
+        let focus = Int((plan.focus / 60).rounded())
+        let pause = Int((plan.shortBreak / 60).rounded())
+        return "Start Pomodoro (\(focus)/\(pause))"
+    }
+
+    /// The skip command's title, or nil for a countdown, which has nothing to skip to. On a
+    /// Pomodoro's last phase skipping ends the session, so it says so rather than promising a
+    /// next phase.
+    static func skipTitle(for snapshot: TimerSnapshot) -> String? {
+        guard snapshot.kind != .countdown else { return nil }
+        if snapshot.isLastPhase { return "Finish Pomodoro" }
+        return snapshot.kind == .focus ? "Skip to Break" : "Skip Break"
     }
 
     /// "5 Minutes", "1 Hour", "90 Minutes".
@@ -89,7 +113,8 @@ enum TimerMenu {
         return "\(phaseName(for: snapshot)) — \(state)"
     }
 
-    private static func phaseName(for snapshot: TimerSnapshot) -> String {
+    /// "Timer", "Focus 2 of 4", "Short Break" or "Long Break".
+    static func phaseName(for snapshot: TimerSnapshot) -> String {
         switch snapshot.kind {
         case .countdown:
             return "Timer"
@@ -104,12 +129,7 @@ enum TimerMenu {
     }
 
     private static func actionItem(_ title: String, action: @escaping () -> Void) -> NSMenuItem {
-        let handler = MenuAction(action)
-        let item = NSMenuItem(title: title, action: #selector(MenuAction.runAction(_:)), keyEquivalent: "")
-        item.target = handler
-        // `target` is weak; the item keeps its handler alive through this.
-        item.representedObject = handler
-        return item
+        NSMenuItem(title: title, run: action)
     }
 
     // MARK: Menu bar
@@ -135,34 +155,39 @@ enum TimerMenu {
         )
     }
 
-    /// The glyph before the countdown: a timer, a focus dot or a cup, or pause while paused.
-    static func statusImage(for snapshot: TimerSnapshot) -> NSImage? {
-        let name: String
-        if snapshot.isPaused {
-            name = TimerMenuConfig.pausedSymbol
-        } else {
-            switch snapshot.kind {
-            case .countdown: name = TimerMenuConfig.countdownSymbol
-            case .focus: name = TimerMenuConfig.focusSymbol
-            case .shortBreak, .longBreak: name = TimerMenuConfig.breakSymbol
-            }
+    /// The SF Symbol for the phase: a timer, a focus dot or a cup, or pause while paused.
+    static func statusSymbol(for snapshot: TimerSnapshot) -> String {
+        if snapshot.isPaused { return TimerMenuConfig.pausedSymbol }
+        switch snapshot.kind {
+        case .countdown: return TimerMenuConfig.countdownSymbol
+        case .focus: return TimerMenuConfig.focusSymbol
+        case .shortBreak, .longBreak: return TimerMenuConfig.breakSymbol
         }
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: statusDescription(for: snapshot))
+    }
+
+    /// The glyph before the countdown: the phase's symbol, or the warning's while there is one.
+    static func statusImage(for snapshot: TimerSnapshot, attention: TimerAttention? = nil) -> NSImage? {
+        let name = attention?.symbol ?? statusSymbol(for: snapshot)
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: statusDescription(for: snapshot, attention: attention))
         return image?.withSymbolConfiguration(NSImage.SymbolConfiguration(scale: .small))
     }
 
-    /// Tooltip and VoiceOver text, e.g. "Open Glow — Focus 2 of 4 — 24:13 left".
-    static func statusDescription(for snapshot: TimerSnapshot) -> String {
-        "Open Glow — \(headerTitle(for: snapshot))"
+    /// Tooltip and VoiceOver text, e.g. "Open Glow — Focus 2 of 4 — 24:13 left", with the
+    /// warning on a line of its own when there is one.
+    static func statusDescription(for snapshot: TimerSnapshot, attention: TimerAttention? = nil) -> String {
+        let timer = "Open Glow — \(headerTitle(for: snapshot))"
+        guard let attention else { return timer }
+        return timer + "\n" + attention.description
     }
 
-    /// Shows the countdown in place of the icon. The status item needs `variableLength` to fit
-    /// it; `showCountdown(_:in:)` sets that too.
-    static func showCountdown(_ snapshot: TimerSnapshot, on button: NSButton) {
-        button.image = statusImage(for: snapshot)
+    /// Shows the countdown in place of the icon, led by `attention`'s symbol when there's
+    /// something to warn about. The status item needs `variableLength` to fit it;
+    /// `showCountdown(_:attention:in:)` sets that too.
+    static func showCountdown(_ snapshot: TimerSnapshot, attention: TimerAttention? = nil, on button: NSButton) {
+        button.image = statusImage(for: snapshot, attention: attention)
         button.imagePosition = .imageLeading
         button.attributedTitle = statusTitle(for: snapshot)
-        button.toolTip = statusDescription(for: snapshot)
+        button.toolTip = statusDescription(for: snapshot, attention: attention)
     }
 
     /// Removes the countdown; the owner then puts its own icon back.
@@ -171,9 +196,9 @@ enum TimerMenu {
         button.imagePosition = .imageOnly
     }
 
-    static func showCountdown(_ snapshot: TimerSnapshot, in item: NSStatusItem) {
+    static func showCountdown(_ snapshot: TimerSnapshot, attention: TimerAttention? = nil, in item: NSStatusItem) {
         item.length = NSStatusItem.variableLength
-        if let button = item.button { showCountdown(snapshot, on: button) }
+        if let button = item.button { showCountdown(snapshot, attention: attention, on: button) }
     }
 
     static func hideCountdown(in item: NSStatusItem) {
@@ -237,25 +262,21 @@ extension TimerMenu.Actions {
     init(controller: TimerController) {
         self.init(
             startCountdown: { [weak controller] in controller?.startCountdown($0) },
-            startPomodoro: { [weak controller] in controller?.startPomodoro() },
+            startPomodoro: { [weak controller] in controller?.startPomodoro($0) },
             pause: { [weak controller] in controller?.pause() },
             resume: { [weak controller] in controller?.resume() },
-            skipPhase: { [weak controller] in controller?.skipPhase() },
+            skipPhase: { [weak controller] in controller?.skipPhase(expecting: $0, round: $1) },
             cancel: { [weak controller] in controller?.cancel() }
         )
     }
-}
 
-/// Runs a closure as a menu item's action.
-@MainActor
-private final class MenuAction: NSObject {
-    private let run: () -> Void
-
-    init(_ run: @escaping () -> Void) {
-        self.run = run
+    /// Starts a countdown of `minutes` whole minutes.
+    func startCountdown(minutes: Int) {
+        startCountdown(TimeInterval(minutes) * 60)
     }
 
-    @objc func runAction(_ sender: Any?) {
-        run()
+    /// Asks for a length and starts it; does nothing if the user cancels.
+    func startCustomCountdown() {
+        if let minutes = askForCustomMinutes() { startCountdown(minutes: minutes) }
     }
 }

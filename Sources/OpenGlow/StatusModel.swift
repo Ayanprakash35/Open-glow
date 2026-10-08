@@ -3,6 +3,8 @@ import Foundation
 /// What Music Sync is doing right now, as shown in the popover and menu.
 enum MusicSyncStatus: Equatable {
     /// Open Glow is turned off, or every display is unchecked — nothing is drawn or captured.
+    /// `Settings.isEnabled` tells the two apart where the difference is shown (the popover, the
+    /// welcome tour, `StatusIcon`).
     case off
     case steady
     case needsPermission
@@ -55,6 +57,80 @@ enum MusicSyncStatus: Equatable {
                 let reason = failure.reason
                 return .captureFailed(reason: reason.hasSuffix(".") ? reason : reason + ".")
             }
+        }
+    }
+}
+
+/// The menu-bar icon for a status, while no timer's countdown stands in for it.
+struct StatusIcon: Equatable {
+    /// SF Symbol name.
+    var symbol: String
+    /// The tooltip, which is also the image's VoiceOver description.
+    var description: String
+    /// Dimmed while nothing is drawn.
+    var appearsDisabled: Bool
+    /// The everyday state, the one the app's own logo stands in for when the bundle has one.
+    var isNormal: Bool
+    /// Music Sync can't work and the user should know: the icon, or a running timer, warns.
+    var isWarning: Bool
+
+    init(symbol: String, description: String, appearsDisabled: Bool = false, isNormal: Bool = false, isWarning: Bool = false) {
+        self.symbol = symbol
+        self.description = description
+        self.appearsDisabled = appearsDisabled
+        self.isNormal = isNormal
+        self.isWarning = isWarning
+    }
+
+    /// `glowEnabled` is the master switch: with it on, `.off` means every display is unchecked.
+    init(status: MusicSyncStatus, glowEnabled: Bool) {
+        switch status {
+        case .off:
+            let description = glowEnabled
+                ? "Open Glow — no display is selected. Turn one on under Displays."
+                : "Open Glow — off"
+            self.init(symbol: "light.min", description: description, appearsDisabled: true)
+        case .needsPermission:
+            self.init(symbol: Self.warningSymbol, description: "Open Glow needs Screen & System Audio Recording access for Music Sync", isWarning: true)
+        case .captureFailed:
+            self.init(symbol: Self.warningSymbol, description: "Open Glow can't capture audio for Music Sync", isWarning: true)
+        case .captureUnreadable:
+            self.init(symbol: Self.warningSymbol, description: "Open Glow can't read the captured audio for Music Sync", isWarning: true)
+        case .steady, .starting, .listening:
+            self.init(symbol: "light.max", description: "Open Glow", isNormal: true)
+        }
+    }
+
+    static let warningSymbol = "exclamationmark.triangle"
+
+    /// The warning a running timer's countdown shows in the icon's place; nil when there's none.
+    var timerAttention: TimerAttention? {
+        isWarning ? TimerAttention(symbol: symbol, description: description) : nil
+    }
+}
+
+extension NowPlayingMonitor.Player {
+    /// The players album colors follow, from the two settings.
+    static func followed(appleMusic: Bool, spotify: Bool) -> Set<Self> {
+        var players: Set<Self> = []
+        if appleMusic { players.insert(.music) }
+        if spotify { players.insert(.spotify) }
+        return players
+    }
+}
+
+extension NowPlayingMonitor.Status {
+    /// The status as the popover shows it when album colors follow only `players`: a track, or
+    /// an Automation problem, from any other player reads as nothing playing. It can't color the
+    /// glow, so naming it beside the swatch would only mislead.
+    func shown(following players: Set<NowPlayingMonitor.Player>) -> Self {
+        switch self {
+        case .playing(let track) where !players.contains(track.player):
+            .notPlaying
+        case .notAuthorized(let player) where !players.contains(player):
+            .notPlaying
+        default:
+            self
         }
     }
 }

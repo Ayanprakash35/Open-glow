@@ -44,10 +44,11 @@ final class DisplayManager {
     /// What the displays actually show.
     private var shownPalette: GlowPalette { sessionPalette ?? palette }
 
-    /// Called after the set of displays changes (connect, disconnect, reconfiguration).
+    /// The running timer's remaining share, for displays that connect while it runs.
     private var timerFraction: Double?
     private var timerRate: Double = 0
 
+    /// Called after the set of displays changes (connect, disconnect, reconfiguration).
     var onDisplaysChanged: (() -> Void)?
 
     /// Whether any overlay is meant to be on screen, by the settings — capture has no reason to

@@ -3,7 +3,6 @@ import SwiftUI
 /// What the popover's buttons do; `AppDelegate` supplies them.
 struct SettingsActions {
     var grantScreenRecording: () -> Void
-    var openScreenRecordingSettings: () -> Void
     var openAutomationSettings: () -> Void
     var retryNowPlaying: () -> Void
     var relaunch: () -> Void
@@ -18,16 +17,19 @@ struct SettingsActions {
 struct SettingsView: View {
     @Bindable var settings: Settings
     let status: StatusModel
+    /// The Timer section's state and controls; `TimerPresenter` keeps it current.
+    let timer: TimerPanelModel
     let actions: SettingsActions
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 12) {
             header
             section("Music") { musicSection }
             section("Colors") { colorSection }
             section("Glow") { glowSection }
             section("Motion") { motionSection }
             section("Displays") { displaySection }
+            section("Timer") { TimerPanel(model: timer) }
             footer
         }
         .controlSize(.small)
@@ -52,7 +54,8 @@ struct SettingsView: View {
                     .toggleStyle(.switch)
                     .labelsHidden()
             }
-            Text("Ambient edge glow that reacts to system audio output — never the microphone.")
+            // One line: the popover is tall enough as it is.
+            Text("Reacts to system audio output — never the microphone.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -75,7 +78,12 @@ struct SettingsView: View {
     private var musicStatus: some View {
         switch status.musicSync {
         case .off:
-            note("Open Glow is off", systemImage: "light.min")
+            if settings.isEnabled {
+                // Off with the switch on: every display is unchecked.
+                note("No display is selected — turn one on under Displays", systemImage: "display")
+            } else {
+                note("Open Glow is off", systemImage: "light.min")
+            }
         case .steady:
             if settings.animationMode == .flow {
                 note("Flowing — audio is ignored", systemImage: "wind")
@@ -89,14 +97,17 @@ struct SettingsView: View {
         case .needsPermission:
             attention(
                 title: "Screen & System Audio Recording access needed",
-                detail: "Music Sync reads system audio through ScreenCaptureKit, which macOS puts behind this permission. Until it's granted, Open Glow shows a steady glow.",
+                detail: "Music Sync reads system audio through ScreenCaptureKit, which macOS puts behind this permission. Until it's granted, Open Glow shows the idle flow.",
                 primary: ("Grant Access…", actions.grantScreenRecording)
             )
         case .captureFailed(let reason):
+            // Access is granted here (`.needsPermission` comes first), so this isn't a permission
+            // problem and resetting the permission won't help; a fresh capture might.
             attention(
                 title: "Music Sync can't capture audio",
-                detail: "\(reason) Open Glow keeps retrying and shows a steady glow meanwhile.",
-                primary: ("Open Privacy & Security…", actions.openScreenRecordingSettings)
+                detail: "\(reason) Open Glow keeps retrying and shows the idle flow meanwhile; relaunching may also help.",
+                primary: ("Relaunch Open Glow", actions.relaunch),
+                isPermissionProblem: false
             )
         case .captureUnreadable:
             attention(
@@ -145,11 +156,27 @@ struct SettingsView: View {
         }
     }
 
+    /// The now-playing state, minus players album colors don't follow.
+    private var nowPlaying: NowPlayingMonitor.Status {
+        let players = NowPlayingMonitor.Player.followed(appleMusic: settings.followAppleMusic, spotify: settings.followSpotify)
+        return status.nowPlaying.shown(following: players)
+    }
+
+    /// What to play, naming only the players album colors follow.
+    private var playPrompt: String {
+        switch (settings.followAppleMusic, settings.followSpotify) {
+        case (true, true): "Play something in Music or Spotify to color the glow from its artwork."
+        case (true, false): "Play something in Music to color the glow from its artwork."
+        case (false, true): "Play something in Spotify to color the glow from its artwork."
+        case (false, false): "Choose Apple Music or Spotify below to color the glow from its artwork."
+        }
+    }
+
     @ViewBuilder
     private var albumArtStatus: some View {
         HStack(alignment: .center, spacing: 10) {
             swatch(status.palette).frame(width: 44, height: 12)
-            switch status.nowPlaying {
+            switch nowPlaying {
             case .playing(let track):
                 VStack(alignment: .leading, spacing: 1) {
                     Text(track.title.isEmpty ? "Untitled track" : track.title).lineLimit(1)
@@ -166,18 +193,18 @@ struct SettingsView: View {
             case .stopped:
                 Text("Paused while Open Glow is off.").font(.caption).foregroundStyle(.secondary)
             case .noPlayer, .notPlaying:
-                Text("Play something in Music or Spotify to color the glow from its artwork.")
+                Text(playPrompt)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        if case .notAuthorized = status.nowPlaying {
+        if case .notAuthorized = nowPlaying {
             HStack {
                 Button("Open Automation Settings…", action: actions.openAutomationSettings)
                 Button("Try Again", action: actions.retryNowPlaying)
             }
-        } else if case .playing = status.nowPlaying, status.albumArtSource == .fallback {
+        } else if case .playing = nowPlaying, status.albumArtSource == .fallback {
             Text("This artwork couldn't be read, so the default palette is showing.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -201,7 +228,18 @@ struct SettingsView: View {
             .disabled(settings.animationMode == .steady || status.systemReducesMotion)
         Toggle("Stereo — each side follows its channel", isOn: $settings.stereoModeEnabled)
             .disabled(settings.animationMode != .musicSync)
-        Toggle("Glow when a Claude Code or Codex session starts", isOn: $settings.codingSessionGlow)
+        Toggle("Glow when a coding session starts", isOn: $settings.codingSessionGlow)
+        HStack(spacing: 14) {
+            ForEach(CodingSessionMonitor.Tool.allCases, id: \.self) { tool in
+                Toggle(tool.displayName, isOn: Binding(
+                    get: { settings.codingSessionTools.contains(tool) },
+                    set: { settings.setCodingSessionGlow($0, for: tool) }
+                ))
+            }
+        }
+        // Lines the tools up under the text of the toggle above, which they refine.
+        .padding(.leading, 20)
+        .disabled(!settings.codingSessionGlow)
         if status.systemReducesMotion {
             Text("Reduce Motion is on in Accessibility settings, so the colors hold still; music still brightens the glow.")
                 .font(.caption2)

@@ -76,7 +76,18 @@ final class TimerController: NSObject {
         if timer?.isPaused == true { resume() } else { pause() }
     }
 
-    func skipPhase() { change { $0.skipPhase(at: $1) } }
+    /// Skips the phase the user was looking at, given as the `kind` and `round` it showed, and
+    /// does nothing if that phase is no longer current. A menu or popover keeps showing what it
+    /// was built from while the timer ticks underneath, so "Skip to Break" can be clicked a moment
+    /// after the focus round ran out on its own. By then the break has started, and skipping
+    /// whatever is current would skip the break too.
+    func skipPhase(expecting kind: TimerKind, round: Int?) {
+        change { timer, now in
+            // `change` has already settled any ended phase, so `phase` is what's current now.
+            guard timer.phase.kind == kind, timer.phase.round == round else { return }
+            timer.skipPhase(at: now)
+        }
+    }
 
     func cancel() {
         guard timer != nil else { return }
