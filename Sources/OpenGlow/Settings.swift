@@ -84,6 +84,7 @@ final class Settings {
         static let followAppleMusic = "followAppleMusic"
         static let followSpotify = "followSpotify"
         static let codingSessionGlow = "codingSessionGlow"
+        static let codingSessionTools = "codingSessionTools"
         static let hasCompletedOnboarding = "hasCompletedOnboarding"
         static let migratedFromGlowbar = "migratedFromGlowbar"
     }
@@ -166,6 +167,29 @@ final class Settings {
         didSet { persist(codingSessionGlow, Key.codingSessionGlow, changed: codingSessionGlow != oldValue, .codingSessionGlow) }
     }
 
+    /// Which tools' sessions get that glow (while `codingSessionGlow` is on). All by default.
+    var codingSessionTools: Set<CodingSessionMonitor.Tool> {
+        didSet {
+            persist(
+                codingSessionTools.map(\.rawValue).sorted(), Key.codingSessionTools,
+                changed: codingSessionTools != oldValue, .codingSessionGlow
+            )
+        }
+    }
+
+    /// Whether a session of `tool` starting plays the glow.
+    func glowsForCodingSession(_ tool: CodingSessionMonitor.Tool) -> Bool {
+        codingSessionGlow && codingSessionTools.contains(tool)
+    }
+
+    func setCodingSessionGlow(_ enabled: Bool, for tool: CodingSessionMonitor.Tool) {
+        if enabled {
+            codingSessionTools.insert(tool)
+        } else {
+            codingSessionTools.remove(tool)
+        }
+    }
+
     /// Whether the welcome tour has been shown (it opens by itself until then).
     var hasCompletedOnboarding: Bool {
         didSet { persist(hasCompletedOnboarding, Key.hasCompletedOnboarding, changed: hasCompletedOnboarding != oldValue, .onboarding) }
@@ -190,6 +214,9 @@ final class Settings {
         followAppleMusic = defaults.object(forKey: Key.followAppleMusic) as? Bool ?? true
         followSpotify = defaults.object(forKey: Key.followSpotify) as? Bool ?? true
         codingSessionGlow = defaults.object(forKey: Key.codingSessionGlow) as? Bool ?? true
+        codingSessionTools = defaults.stringArray(forKey: Key.codingSessionTools)
+            .map { Set($0.compactMap(CodingSessionMonitor.Tool.init(rawValue:))) }
+            ?? Set(CodingSessionMonitor.Tool.allCases)
         hasCompletedOnboarding = defaults.bool(forKey: Key.hasCompletedOnboarding)
     }
 
