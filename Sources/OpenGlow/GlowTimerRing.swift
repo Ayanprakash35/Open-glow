@@ -6,6 +6,8 @@ enum TimerRingConfig {
     static let edgeSoftness: Double = 0.06
     /// Extra brightness and width of the bright head at the receding end. Sane range: 0–0.6.
     static let headBoost: Float = 0.35
+    /// Length of that head, as a share of the end's softness. Sane range: 0.3–1.2.
+    static let headLength: Double = 0.6
     /// Brightness of the used-up part of the edge, as a share of normal. Sane range: 0–0.15.
     static let spentLevel: Float = 0
     /// Seconds the shown ring takes to catch up with a step down (time passing) and a step up (a
@@ -137,7 +139,7 @@ struct TimerRing {
         let lit = Float(1 - smoothstep(remaining / 2 - half, remaining / 2 + half, abs(fromMiddle)))
         var fromHead = along - (remaining - half / 2)
         fromHead -= fromHead.rounded()
-        let offset = fromHead / (0.6 * half)
+        let offset = fromHead / (TimerRingConfig.headLength * half)
         let head = TimerRingConfig.headBoost * Float(half / maximum) * Float(exp(-offset * offset)) * lit
         return (lit, head)
     }

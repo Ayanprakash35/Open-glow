@@ -79,6 +79,13 @@ enum GlowMotionConfig {
     static let musicBlendSeconds: Double = 0.9
     /// Stereo: the quieter side's brightness never drops below this share of the louder one's.
     static let stereoFloor: Float = 0.35
+    /// Stereo: seconds for the left/right balance to follow the music, and to even out again
+    /// once it stops. Sane ranges: 0.05–0.4 and 0.2–1.5.
+    static let stereoFollowSeconds: Double = 0.15
+    static let stereoReleaseSeconds: Double = 0.5
+    /// Stereo: added to both sides' energy before comparing them, so near-silence doesn't swing
+    /// the balance to one side. Sane range: 0.005–0.1.
+    static let stereoEnergyOffset: Float = 0.02
     /// Seconds of envelope history kept: enough for a swell to reach the farthest point it
     /// travels to (half the distance between origins) on a large display, plus margin.
     static let historySeconds: Double = 1.5
@@ -97,6 +104,9 @@ enum GlowMotionConfig {
     static let introEdgeSoftness: Double = 0.035
     /// Extra brightness and width of the sweep's bright head (0 = no head). Sane range: 0–1.
     static let introHeadBoost: Float = 0.7
+    /// Length of a sweep's bright head (opening and accents), as a multiple of the leading edge's
+    /// softness. Sane range: 1–3.
+    static let sweepHeadLength: Double = 1.6
     /// The Reactivity setting (0...1) scales music by up to this factor; 0.5 gives the values above.
     static let maxReactivity: Float = 2
 
@@ -114,6 +124,9 @@ enum GlowMotionConfig {
     static let accentSettleSeconds: Double = 0.6
     /// Extra brightness and width of the sweep's head. Sane range: 0–1.
     static let accentHeadBoost: Float = 0.7
+    /// Frames per second while an accent only holds and nothing else moves (Steady, Reduce
+    /// Motion): just enough to notice when its fade begins. Sane range: 1–6.
+    static let accentHoldFrameRate: Double = 2
 
     // MARK: Frame pacing
 
@@ -134,6 +147,9 @@ enum GlowMotionConfig {
     static let slowMusicFrameRate: Double = 30
     /// Frame rate for cross-fades: palettes, music starting or stopping. Sane range: 20–60.
     static let fadeFrameRate: Double = 30
+    /// Longest step one frame may take, in seconds, unless the frame rate itself is slower: a
+    /// stall (the main thread busy) skips ahead by at most this. Sane range: 0.05–0.25.
+    static let maximumStepSeconds: Double = 0.1
 }
 
 /// The edge light's state from moment to moment: for every cell around the screen, its color,
@@ -282,6 +298,11 @@ final class GlowMotion {
         ring.settle()
     }
 
+    /// Ends a showing accent at once, after time passed unseen.
+    func cancelAccent() {
+        accent.cancel()
+    }
+
     /// The timer ring's shown remaining share (nil without a ring) — for tests.
     var shownTimerRing: Double? { ring.shown }
 
@@ -293,8 +314,13 @@ final class GlowMotion {
     }
 
     /// Advances by `dt` seconds and recomputes every cell. `audio` is nil outside Music Sync.
-    func step(dt: Double, audio: AudioAnalysisState?, settings: GlowMotionSettings) {
-        let dt = min(max(dt, 0), 0.1)
+    /// `maximumDt` caps the step after a stall; pass more when frames are deliberately that far
+    /// apart, or anything timed (an accent, the timer ring) would run slow.
+    func step(
+        dt: Double, audio: AudioAnalysisState?, settings: GlowMotionSettings,
+        maximumDt: Double = GlowMotionConfig.maximumStepSeconds
+    ) {
+        let dt = min(max(dt, 0), maximumDt)
         time += dt
         let config = GlowMotionConfig.self
         let moving = settings.animation != .steady && !settings.reduceMotion
@@ -306,14 +332,19 @@ final class GlowMotion {
             let bass = max(audio.bass - config.bassThreshold, 0) / (1 - config.bassThreshold)
             heldBeat = max(audio.beatPulse, heldBeat * Float(exp(-dt / config.beatHoldSeconds)))
             target = min(config.beatWeight * heldBeat + config.bassWeight * bass, 1)
-            let louder = max(audio.leftEnergy, audio.rightEnergy) + 0.02
-            stereoLeft = approach(stereoLeft, (audio.leftEnergy + 0.02) / louder, seconds: 0.15, dt: dt)
-            stereoRight = approach(stereoRight, (audio.rightEnergy + 0.02) / louder, seconds: 0.15, dt: dt)
+            // Non-finite energies (from non-finite audio) would stick here for good.
+            let left = audio.leftEnergy.isFinite ? audio.leftEnergy : 0
+            let right = audio.rightEnergy.isFinite ? audio.rightEnergy : 0
+            let offset = config.stereoEnergyOffset
+            let louder = max(left, right) + offset
+            stereoLeft = approach(stereoLeft, (left + offset) / louder, seconds: config.stereoFollowSeconds, dt: dt)
+            stereoRight = approach(stereoRight, (right + offset) / louder, seconds: config.stereoFollowSeconds, dt: dt)
         } else {
             heldBeat = 0
-            stereoLeft = approach(stereoLeft, 1, seconds: 0.5, dt: dt)
-            stereoRight = approach(stereoRight, 1, seconds: 0.5, dt: dt)
+            stereoLeft = approach(stereoLeft, 1, seconds: config.stereoReleaseSeconds, dt: dt)
+            stereoRight = approach(stereoRight, 1, seconds: config.stereoReleaseSeconds, dt: dt)
         }
+        if !stereoLeft.isFinite || !stereoRight.isFinite { (stereoLeft, stereoRight) = (1, 1) }
         let seconds = target > envelope ? config.envelopeAttackSeconds : config.envelopeReleaseSeconds
         let before = envelope
         envelope = approach(envelope, target, seconds: seconds, dt: dt)

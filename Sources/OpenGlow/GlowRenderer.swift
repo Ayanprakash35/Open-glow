@@ -20,6 +20,16 @@ enum GlowFrameConfig {
     /// Frames per second while Music Sync waits for audio with nothing else moving (Reduce
     /// Motion), so music starting is noticed. Sane range: 4–20.
     static let audioPollFrameRate: Double = 10
+    /// A display tick this soon after the last frame, as a share of the asked-for interval, is
+    /// skipped (the display runs faster than asked). Below 1 so normal jitter never drops a
+    /// frame. Sane range: 0.6–0.9.
+    static let earlyTickShare: Double = 0.75
+    /// Longest a frame may be late, as a multiple of the asked-for interval, before the motion
+    /// treats the gap as a stall rather than time to advance through. Sane range: 1.2–3.
+    static let lateFrameShare: Double = 1.5
+    /// Seconds between rebuilds of the strips while a setting that reshapes them keeps changing
+    /// (a slider being dragged): each rebuild takes tens of milliseconds. Sane range: 0.03–0.2.
+    static let reshapeInterval: Double = 0.08
 }
 
 /// Configuration for the overlay window's stacking level.
@@ -34,8 +44,8 @@ enum WindowConfig {
 /// colors around the screen, and in Music Sync, swells that travel along the edges with the music.
 ///
 /// `GlowMotion` decides each moment's colors, brightness and widths around the perimeter;
-/// `EdgeLightRasterizer` turns them into four strip images (top, bottom, left, right), which this
-/// view shows as layer contents, scaled up smoothly. There are no masks, shadows or offscreen
+/// `EdgeLightRasterizer` turns them into strip images along the edges (corners, notch, the spans
+/// between them, and the sides), which this view shows as layer contents, scaled up smoothly. There are no masks, shadows or offscreen
 /// passes. One display link drives everything while anything moves, at the frame rate the motion
 /// needs (60 fps only for fast music swells and sweeps, ~20 for the idle flow, a few for a timer
 /// ring alone). It stops when the glow holds still or the window can't be seen (covered, screen
@@ -59,6 +69,9 @@ final class GlowView: NSView {
     private var framesSinceReport = 0
     private var presentsSinceReport = 0
     private var lastReport: CFTimeInterval = 0
+    /// When a settings change last rebuilt the strips, and whether another rebuild is waiting.
+    private var lastSettingsReshape: CFTimeInterval = 0
+    private var reshapeScheduled = false
 
     /// Peak opacity at the edge, 0...1.
     var brightness: CGFloat = GlowDefaults.brightness {
@@ -67,19 +80,20 @@ final class GlowView: NSView {
 
     /// Main falloff length in points.
     var thickness: CGFloat = GlowDefaults.thickness {
-        didSet { if thickness != oldValue { reshape() } }
+        didSet { if thickness != oldValue { setNeedsReshape() } }
     }
 
     /// Share of the light in the faint tail, 0...1.
     var softness: CGFloat = GlowDefaults.softness {
-        didSet { if softness != oldValue { reshape() } }
+        didSet { if softness != oldValue { setNeedsReshape() } }
     }
 
     var motionSettings = GlowMotionSettings() {
         didSet {
             guard motionSettings != oldValue else { return }
             // The widest swell depends on reactivity, and the strips are sized for it.
-            if motionSettings.reactivity != oldValue.reactivity { reshape() } else { redraw() }
+            if motionSettings.reactivity != oldValue.reactivity { setNeedsReshape() }
+            redraw()
             updateLink()
         }
     }
@@ -183,21 +197,35 @@ final class GlowView: NSView {
         reshape()
     }
 
+    /// AppKit calls this for a new backing scale and for a new display color space (a color
+    /// profile chosen in System Settings, HDR turned on).
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         let scale = window?.backingScaleFactor ?? 2
         withoutAnimation { stripLayers.forEach { $0.contentsScale = scale } }
+        reshape()
     }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
         let center = NotificationCenter.default
-        if let window { center.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: window) }
+        if let window {
+            center.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: window)
+            center.removeObserver(self, name: NSWindow.didChangeScreenProfileNotification, object: window)
+        }
         if let newWindow {
             center.addObserver(
                 self, selector: #selector(occlusionChanged), name: NSWindow.didChangeOcclusionStateNotification, object: newWindow
             )
+            // Strips tagged with the old color space would be color-matched every frame.
+            center.addObserver(
+                self, selector: #selector(screenProfileChanged), name: NSWindow.didChangeScreenProfileNotification, object: newWindow
+            )
         }
+    }
+
+    @objc private func screenProfileChanged(_ notification: Notification) {
+        reshape()
     }
 
     override func viewDidMoveToWindow() {
@@ -216,12 +244,34 @@ final class GlowView: NSView {
     @objc private func occlusionChanged(_ notification: Notification) {
         logger.debug("Overlay visible: \(self.isOnScreen, privacy: .public)")
         if isOnScreen {
-            // Time passed unseen: carry on from now, with the timer ring where it should be.
+            // Time passed unseen: carry on from now, with the timer ring where it should be and
+            // no stale accent.
             lastTimestamp = nil
             motion.settleTimerRing()
+            motion.cancelAccent()
             redraw()
         }
         updateLink()
+    }
+
+    /// Rebuilds the strips soon after a setting that shapes them changes: at once the first time,
+    /// then at most every `GlowFrameConfig.reshapeInterval` while it keeps changing, and once more
+    /// at the end so the last value always lands.
+    private func setNeedsReshape() {
+        guard !reshapeScheduled else { return }
+        let wait = lastSettingsReshape + GlowFrameConfig.reshapeInterval - CACurrentMediaTime()
+        guard wait > 0 else {
+            lastSettingsReshape = CACurrentMediaTime()
+            reshape()
+            return
+        }
+        reshapeScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+            guard let self else { return }
+            reshapeScheduled = false
+            lastSettingsReshape = CACurrentMediaTime()
+            reshape()
+        }
     }
 
     /// Rebuilds the strips for the current size, notch, thickness, softness, reactivity and
@@ -238,7 +288,7 @@ final class GlowView: NSView {
             notch: notchGeometry,
             falloff: thickness,
             softness: Float(softness),
-            maximumWidth: 1 + max(GlowMotionConfig.musicWidthGain * motionSettings.reactivity, GlowMotionConfig.idleWidthDepth),
+            maximumWidth: Self.maximumWidth(reactivity: motionSettings.reactivity),
             colorSpace: displaySpace
         )
         if rasterizer.configure(shape, cells: motion.count) {
@@ -252,6 +302,15 @@ final class GlowView: NSView {
             rebuildLayers()
         }
         redraw()
+    }
+
+    /// Widest the glow gets, as a multiple of Thickness: the widest swell or idle patch, plus room
+    /// for a sweep's head or a timer's finish pulse on top of it.
+    static func maximumWidth(reactivity: Float) -> Float {
+        let config = GlowMotionConfig.self
+        let widest = max(config.musicWidthGain * reactivity, config.idleWidthDepth)
+        let effects = max(config.introHeadBoost, config.accentHeadBoost, TimerRingConfig.headBoost, TimerRingConfig.pulseBoost)
+        return 1 + widest + effects
     }
 
     private func rebuildLayers() {
@@ -325,7 +384,7 @@ final class GlowView: NSView {
     @objc private func frame(_ link: CADisplayLink) {
         // The display may tick faster than asked (another window wants its full rate): only do
         // the work this pace needs.
-        if let previous = lastTimestamp, link.timestamp - previous < 0.75 / max(linkRate, 1) { return }
+        if let previous = lastTimestamp, link.timestamp - previous < GlowFrameConfig.earlyTickShare / max(linkRate, 1) { return }
         let previous = lastTimestamp
         lastTimestamp = link.timestamp
         let dt = previous.map { link.timestamp - $0 } ?? (link.targetTimestamp - link.timestamp)
@@ -336,7 +395,9 @@ final class GlowView: NSView {
             audioActive = state.hasAudio && !state.isSilent
             audio = state
         }
-        motion.step(dt: dt, audio: audio, settings: motionSettings)
+        // At a few frames a second each step is long by design, not a stall to skip.
+        let maximumDt = max(GlowMotionConfig.maximumStepSeconds, GlowFrameConfig.lateFrameShare / max(linkRate, 1))
+        motion.step(dt: dt, audio: audio, settings: motionSettings, maximumDt: maximumDt)
         present()
         if link.timestamp - lastReport >= 5 {
             if lastReport > 0 {

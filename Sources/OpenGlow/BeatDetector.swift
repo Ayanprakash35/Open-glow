@@ -163,6 +163,8 @@ struct EnvelopeFollower {
     private(set) var value: Float = 0
 
     mutating func update(target: Float, dt: Double) -> Float {
+        // A NaN would stick for good: every later step moves *from* the current value.
+        guard target.isFinite else { return value }
         let timeConstant = target > value ? attackSeconds : releaseSeconds
         let alpha = Float(1 - exp(-dt / max(timeConstant, 0.0001)))
         value += alpha * (target - value)
@@ -657,14 +659,17 @@ final class BeatDetector: @unchecked Sendable {
         var rightRMS: Float = 0
         vDSP_rmsqv(leftSamples, 1, &leftRMS, n)
         vDSP_rmsqv(rightSamples, 1, &rightRMS, n)
+        // A window holding a non-finite sample (a misbehaving audio source) counts as silence:
+        // its NaN would otherwise reach the stereo levels and stay there.
+        let isFinite = leftRMS.isFinite && rightRMS.isFinite
         // Per-channel power, not a mono mix: out-of-phase stereo content must not cancel out.
-        let level = sqrt((leftRMS * leftRMS + rightRMS * rightRMS) / 2)
+        let level = isFinite ? sqrt((leftRMS * leftRMS + rightRMS * rightRMS) / 2) : 0
         updateGate(level: level, dt: dt, now: now)
 
         var bass: Float = 0, mid: Float = 0, treble: Float = 0, left: Float = 0, right: Float = 0
         var beat: (fired: Bool, size: Float?) = (false, nil)
 
-        if gateOpen {
+        if gateOpen && isFinite {
             computePowerSpectrum()
 
             let bassDb = Self.decibels(bandPower(bassBins))

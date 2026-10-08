@@ -14,7 +14,7 @@ enum EdgeSweep {
     /// head's profile there (0...1, peaking just behind the front).
     static func cell(distance: Double, front: Double, softness: Double) -> (lit: Float, head: Float) {
         let lit = Float(1 - smoothstep(front - softness, front + softness, distance))
-        let offset = (distance - front) / (softness * 1.6)
+        let offset = (distance - front) / (softness * GlowMotionConfig.sweepHeadLength)
         return (lit, Float(exp(-offset * offset)) * lit)
     }
 
@@ -105,11 +105,19 @@ struct GlowAccent {
         guard palette != nil else { return 0 }
         let config = GlowMotionConfig.self
         if elapsed < config.accentSweepSeconds + config.accentSettleSeconds, head.contains(where: { $0 > 0.001 }) {
-            return 60
+            return config.fastMusicFrameRate
         }
         let fadeStart = config.accentSweepSeconds + config.accentHoldSeconds
         let fading = elapsed >= fadeStart || share.contains { $0 < 0.999 }
-        return fading ? 30 : (moving ? 0 : 2)
+        return fading ? config.fadeFrameRate : (moving ? 0 : config.accentHoldFrameRate)
+    }
+
+    /// Ends the accent at once, for time that passed unseen: it's a moment's notice, and showing
+    /// the rest of it minutes later would announce something long over.
+    mutating func cancel() {
+        palette = nil
+        previous = nil
+        fill(share: 0)
     }
 
     private mutating func fill(share value: Float) {

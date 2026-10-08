@@ -25,9 +25,10 @@ enum EdgeLightConfig {
 /// Turns `GlowMotion`'s per-cell colors, brightness and widths into pixels: light coming in from
 /// the screen edge, brightest at the edge and falling off smoothly inward.
 ///
-/// Only the border can ever be lit, so the light is computed in strips — along the top (tall
-/// enough to wrap the notch), bottom, left and right — at a cell size a few to a falloff length,
-/// and Core Animation scales each strip up with linear filtering. Corners and the notch get
+/// Only the border can ever be lit, so the light is computed in strips — zones along the top
+/// (tall enough to wrap the notch), bottom, left and right: the corners, the notch, the spans of
+/// edge between them, and the sides — at a cell size a few to a falloff length, and Core
+/// Animation scales each strip up with linear filtering. Corners and the notch get
 /// square cells; elsewhere a cell spans a whole perimeter cell along the edge. Every cell's distance from the edge
 /// and position around the screen are worked out once per size or shape change (`EdgeGeometry`);
 /// a frame is then, per cell, one table lookup and two integer multiplies.
@@ -193,12 +194,12 @@ final class EdgeLightRasterizer {
         packedColor.withUnsafeMutableBufferPointer { packed in
         bucketOfCell.withUnsafeMutableBufferPointer { bucket in
             for i in 0..<min(width.count, bucket.count) {
-                let b = Int32(min(max(((width[i] - 1) / span * Float(buckets - 1)).rounded(), 0), Float(buckets - 1)))
+                let b = Int32((Self.unit((width[i] - 1) / span) * Float(buckets - 1)).rounded())
                 bucket[i] = b * steps
-                let alpha = min(max(amplitude[i] * brightness, 0), 1)
-                let r = UInt32(min(max(red[i], 0), 1) * alpha * 255 + 0.5)
-                let g = UInt32(min(max(green[i], 0), 1) * alpha * 255 + 0.5)
-                let b8 = UInt32(min(max(blue[i], 0), 1) * alpha * 255 + 0.5)
+                let alpha = Self.unit(amplitude[i] * brightness)
+                let r = UInt32(Self.unit(red[i]) * alpha * 255 + 0.5)
+                let g = UInt32(Self.unit(green[i]) * alpha * 255 + 0.5)
+                let b8 = UInt32(Self.unit(blue[i]) * alpha * 255 + 0.5)
                 let a = UInt32(alpha * 255 + 0.5)
                 packed[i] = b8 | g << 8 | r << 16 | a << 24
                 // A dark cell lights nothing, however wide.
@@ -206,6 +207,13 @@ final class EdgeLightRasterizer {
             }
         }}}}}}}
         return widest
+    }
+
+    /// `value` clamped to 0...1, with NaN as 0: converting a NaN to an integer traps, and plain
+    /// `min`/`max` pass a NaN through.
+    @inline(__always)
+    private static func unit(_ value: Float) -> Float {
+        value > 0 ? min(value, 1) : 0
     }
 
     /// One strip: per lit cell within reach, the perimeter cell's packed color scaled by the
@@ -306,9 +314,12 @@ final class EdgeLightRasterizer {
         let cellSize = max(shape.falloff / EdgeLightConfig.cellsPerFalloff, EdgeLightConfig.minimumCellSize)
         let along = max(geometry.perimeter / CGFloat(cells), cellSize)
         let w = shape.size.width, h = shape.size.height
-        let topHeight = min(reach + geometry.notchDepth, h / 2)
-        let bottomHeight = min(reach, h / 2)
-        let sideWidth = min(reach, w / 2)
+        // Zone edges on whole points, as in `spans`: a screen pixel split between two zones gets
+        // both layers' partial coverage blended, which draws a faint dark line along the seam.
+        let depth = reach.rounded(.up)
+        let topHeight = min((depth + geometry.notchDepth).rounded(.up), h / 2)
+        let bottomHeight = min(depth, h / 2)
+        let sideWidth = min(depth, w / 2)
         let sideHeight = max(h - topHeight - bottomHeight, 0)
 
         var notchSpan: ClosedRange<CGFloat>?
