@@ -3,6 +3,44 @@
 All notable changes to Open Glow. The full story, with dates and the problems solved along the
 way, is in [docs/DEVLOG.md](docs/DEVLOG.md).
 
+## 0.1.1 — 12 October 2026
+
+### Added
+- **Timer on the main page**: a Timer section in the popover with a countdown menu, Custom…,
+  Start Pomodoro, and Pause/Resume, Skip and Cancel while it runs.
+- **Right-click menu options** for colors (source, presets, which players), coding sessions
+  (per tool, with previews) and Launch at Login.
+- **Per-tool coding-session switches** for Claude Code and Codex, in the popover, the menu and
+  the welcome tour.
+- `Scripts/make_icons.sh` and icon bundling, ready for a custom app and menu-bar icon.
+
+### Changed
+- The timer ring recedes smoothly at the timer's own pace instead of in once-a-second steps.
+- While music plays, audio analysis no longer wakes the Mac on a timer (about 10 fewer wake-ups a
+  second).
+- Album colors: unticking Apple Music or Spotify takes effect at once and that player is never
+  contacted again (no Apple Events, no Automation prompt, no downloads); your own Music files are
+  no longer looked up online; lookups work in every region and pick the right album edition.
+- Settings sliders rebuild the glow at most every 80 ms while dragged, so they no longer lag.
+- The welcome tour shows the coding-session glow's real colors.
+- Requires macOS 26 (now enforced by the app bundle).
+
+### Fixed
+- A crash with Stereo on when another app played audio containing invalid samples.
+- The coding-session sweep lasting about 3× too long in Steady mode or with Reduce Motion.
+- A faint dark line where the glow's strips meet.
+- A display color-profile change leaving the glow costing extra CPU until another setting changed.
+- A coding-session sweep cut off by locking the screen replaying after unlock.
+- Sweep heads and timer pulses losing their width at low Reactivity.
+- Claude Code installed with npm not being detected.
+- "Skip to Break" also skipping the break when clicked just as a focus round ended; the long
+  break's skip button now reads "Finish Pomodoro".
+- Music Sync warnings hidden while a timer runs in the menu bar.
+- "Grant Access…" doing nothing right after a grant that needs a relaunch; capture failures shown
+  as permission problems; "Open Glow is off" shown when only the displays were unticked.
+- `setup_signing.sh` reporting "Already set up" after a half-finished run; `build_app.sh` now
+  falls back to ad-hoc signing instead of failing.
+
 ## 0.1.0 — 7 October 2026
 
 First public release, renamed from Glowbar and published under the MIT license.

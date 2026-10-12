@@ -6,6 +6,10 @@
 
 ![Open Glow on a MacBook screen](docs/images/hero.png)
 
+### [⬇ Download Open Glow for Mac](https://github.com/Ayanprakash35/Open-glow/releases/latest/download/Open-Glow.dmg)
+
+macOS 26 or later · Apple silicon · free and open source
+
 [Features](#features) · [Install](#install) · [Permissions](#permissions) · [Using it](#using-open-glow) · [Troubleshooting](#troubleshooting) · [How it works](#how-it-works)
 
 </div>
@@ -56,16 +60,35 @@ Different palettes — the soft default, a warm album, a cool album:
 ## Requirements
 
 - macOS 26 or later, Apple silicon
-- To build: Swift 6 — Xcode, or just the Command Line Tools (`xcode-select --install`)
+- To build it yourself: Swift 6 — Xcode, or just the Command Line Tools (`xcode-select --install`)
 
 ## Install
 
-**Download:** grab `Open-Glow-<version>.dmg` (or the `.zip`) from the
-[latest release](https://github.com/Ayanprakash35/Open-glow/releases/latest), drag **Open Glow**
-to Applications, then see [Running a build you downloaded](#running-a-build-you-downloaded) — the
-app isn't notarized, so macOS needs one command before it will open it.
+1. **[Download Open-Glow.dmg](https://github.com/Ayanprakash35/Open-glow/releases/latest/download/Open-Glow.dmg)**
+   and open it.
+2. Drag **Open Glow** into the **Applications** folder.
+3. Open it from Applications. Open Glow isn't from the App Store, so the first time macOS says it
+   can't verify it — click **Done**, then go to **System Settings › Privacy & Security**, scroll
+   down and click **Open Anyway** next to "Open Glow was blocked". You only do this once.
+4. The welcome tour walks you through the rest.
 
-**Build it yourself** (about a minute):
+<details>
+<summary>Prefer the Terminal for step 3?</summary>
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Open Glow.app"
+```
+
+</details>
+
+Updating: download the new version and replace the app in Applications. macOS may ask for
+Screen & System Audio Recording again after an update — if Music Sync stops reacting, see
+[Troubleshooting](#troubleshooting). Older versions are on the
+[Releases](https://github.com/Ayanprakash35/Open-glow/releases) page.
+
+### Build it yourself
+
+About a minute, with Xcode or just the Command Line Tools:
 
 ```bash
 git clone https://github.com/Ayanprakash35/Open-glow.git
@@ -75,9 +98,8 @@ cd Open-glow
 open "build/Open Glow.app"
 ```
 
-Copy `build/Open Glow.app` to `/Applications` if you like. Always start it through `open` (or
-Finder), not by running the binary inside it — macOS then checks Open Glow's own permissions
-rather than your terminal's.
+Always start it through `open` (or Finder), not by running the binary inside it — macOS then
+checks Open Glow's own permissions rather than your terminal's.
 
 ### Signing
 
@@ -99,20 +121,6 @@ Without it, `build_app.sh` signs ad-hoc. If the identity is there but can't be u
 still finishes: it prints a warning and signs ad-hoc instead. You can also sign with any identity
 of your own, `OPENGLOW_SIGN_IDENTITY="My Identity" ./Scripts/build_app.sh`, or force ad-hoc with
 `OPENGLOW_SIGN_IDENTITY=-`.
-
-### Running a build you downloaded
-
-Release builds are signed ad-hoc and not notarized, so macOS quarantines the download and won't
-open it. Clear the quarantine flag (and, for a copy from anywhere else, re-sign it ad-hoc):
-
-```bash
-xattr -dr com.apple.quarantine "/Applications/Open Glow.app"
-codesign --force --deep --sign - "/Applications/Open Glow.app"   # only for copies from elsewhere
-```
-
-An ad-hoc signature changes with every version, so after updating, macOS may ask for Screen &
-System Audio Recording again (if Music Sync stops reacting, see
-[Troubleshooting](#troubleshooting)).
 
 ## Permissions
 
