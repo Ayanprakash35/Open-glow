@@ -64,16 +64,29 @@ Different palettes — the soft default, a warm album, a cool album:
 
 ## Install
 
-1. **[Download Open-Glow.dmg](https://github.com/Ayanprakash35/Open-glow/releases/latest/download/Open-Glow.dmg)**
-   and open it.
-2. Drag **Open Glow** into the **Applications** folder.
-3. Open it from Applications. Open Glow isn't from the App Store, so the first time macOS says it
-   can't verify it — click **Done**, then go to **System Settings › Privacy & Security**, scroll
-   down and click **Open Anyway** next to "Open Glow was blocked". You only do this once.
-4. The welcome tour walks you through the rest.
+**1. Download** — [**Open-Glow.dmg**](https://github.com/Ayanprakash35/Open-glow/releases/latest/download/Open-Glow.dmg)
+
+**2. Install** — open the downloaded file and drag **Open Glow** onto the **Applications** folder.
+
+**3. Approve it (first time only)** — Open Glow isn't from the App Store, so macOS blocks it the
+first time:
+
+- Open **Open Glow** from Applications. macOS says *"Open Glow" Not Opened* — click **Done**.
+- Open **System Settings › Privacy & Security** and scroll down to **Security**.
+- Next to *"Open Glow" was blocked*, click **Open Anyway**, then **Open Anyway** again and enter
+  your password (or use Touch ID).
+
+Open Glow starts, and from then on it opens normally.
+
+**4. Allow audio** — the welcome tour opens and asks for **Screen & System Audio Recording**, which
+Music Sync needs to hear your Mac's sound (Open Glow never looks at your screen or uses the
+microphone). Switch Open Glow on in the list, then click **Quit & Reopen** when macOS asks.
+
+**5. Allow album colors** — the first time a song plays, macOS asks whether Open Glow may access
+Music or Spotify. Click **Allow** so the glow can take the album art's colors.
 
 <details>
-<summary>Prefer the Terminal for step 3?</summary>
+<summary>Comfortable with Terminal? Step 3 in one line</summary>
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/Open Glow.app"
@@ -81,8 +94,8 @@ xattr -dr com.apple.quarantine "/Applications/Open Glow.app"
 
 </details>
 
-Updating: download the new version and replace the app in Applications. macOS may ask for
-Screen & System Audio Recording again after an update — if Music Sync stops reacting, see
+**Updating:** download the new version and replace the app in Applications. You may need to
+approve it (step 3) and allow audio (step 4) again — if Music Sync stops reacting, see
 [Troubleshooting](#troubleshooting). Older versions are on the
 [Releases](https://github.com/Ayanprakash35/Open-glow/releases) page.
 
